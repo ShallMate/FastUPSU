@@ -1,0 +1,8 @@
+/build*/
+/logs/
+/results/
+/core
+/core.*
+*.bin
+*.csv
+*.log

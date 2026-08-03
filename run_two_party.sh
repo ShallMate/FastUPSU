@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="${SCRIPT_DIR}"
+source "${PROJECT_ROOT}/scripts/common.sh"
+BIN="${BIN:-${BUILD_DIR}/psu}"
+SETTINGS_FILE="${PSU_SETTINGS_FILE:-${SCRIPT_DIR}/settings.json}"
+PROFILE="${PSU_PROFILE:-}"
+PARTIES="${PSU_PARTIES:-127.0.0.1:9300,127.0.0.1:9301}"
+BUILD_FIRST="${BUILD_FIRST:-0}"
+LOG_DIR="${LOG_DIR:-${SCRIPT_DIR}/logs}"
+RECEIVER_LOG="${LOG_DIR}/receiver.log"
+SENDER_LOG="${LOG_DIR}/sender.log"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  run_two_party.sh
+
+The current PSU implementation builds sender setup state on the fly.
+Persistent prepared/intermediate cache files are not required.
+
+Optional environment overrides:
+  BUILD_FIRST=0|1
+  BIN=/abs/path/to/psu_binary
+  PSU_SETTINGS_FILE=/abs/path/to/settings.json
+  PSU_PROFILE=x20_y10
+  PSU_CACHE_TAG=pm4096_try1
+  PSU_PARTIES=127.0.0.1:9300,127.0.0.1:9301
+  PSU_ONLINE_THREADS=1
+  PSU_MEDIUM_NX=16777216
+  PSU_MEDIUM_NY=4096
+  PSU_MEDIUM_CAP=128
+  PSU_MOD_SWITCH_STEPS=2
+  PSU_SYNTHETIC_ONLINE=1
+
+Examples:
+  PSU_PROFILE=x20_y10 run_two_party.sh
+  PSU_PROFILE=x22_y14 PSU_CACHE_TAG=pm8192_try1 run_two_party.sh
+  PSU_PROFILE=x24_y12 PSU_ONLINE_THREADS=1 run_two_party.sh
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+mkdir -p "${LOG_DIR}"
+
+cleanup() {
+  if [[ -n "${RECEIVER_PID:-}" ]] && kill -0 "${RECEIVER_PID}" 2>/dev/null; then
+    kill "${RECEIVER_PID}" 2>/dev/null || true
+    wait "${RECEIVER_PID}" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+
+if [[ "${BUILD_FIRST}" == "1" ]]; then
+  build_psu
+fi
+
+if [[ ! -x "${BIN}" ]]; then
+  echo "binary not found or not executable: ${BIN}" >&2
+  exit 1
+fi
+
+echo "Starting two-party PSU run"
+echo "  bin:      ${BIN}"
+echo "  settings: ${SETTINGS_FILE}"
+if [[ -n "${PROFILE}" ]]; then
+  echo "  profile:  ${PROFILE}"
+fi
+if [[ -n "${PSU_CACHE_TAG:-}" ]]; then
+echo "  cache tag:${PSU_CACHE_TAG}"
+fi
+echo "  parties:  ${PARTIES}"
+echo "  logs:     ${RECEIVER_LOG}, ${SENDER_LOG}"
+
+(
+  cd "${PROJECT_ROOT}"
+  env \
+    PSU_MODE=receiver \
+    PSU_SETTINGS_FILE="${SETTINGS_FILE}" \
+    PSU_PROFILE="${PROFILE}" \
+    PSU_PARTIES="${PARTIES}" \
+    stdbuf -oL -eL "${BIN}" 2>&1 \
+    | tee "${RECEIVER_LOG}" \
+    | sed 's/^/[receiver] /'
+) &
+RECEIVER_PID=$!
+
+sleep 1
+
+set +e
+(
+  cd "${PROJECT_ROOT}"
+  env \
+    PSU_MODE=sender \
+    PSU_SETTINGS_FILE="${SETTINGS_FILE}" \
+    PSU_PROFILE="${PROFILE}" \
+    PSU_PARTIES="${PARTIES}" \
+    stdbuf -oL -eL "${BIN}" 2>&1 \
+    | tee "${SENDER_LOG}" \
+    | sed 's/^/[sender] /'
+)
+SENDER_STATUS=$?
+wait "${RECEIVER_PID}"
+RECEIVER_STATUS=$?
+set -e
+
+if [[ "${SENDER_STATUS}" -ne 0 || "${RECEIVER_STATUS}" -ne 0 ]]; then
+  echo "two-party run failed: receiver=${RECEIVER_STATUS}, sender=${SENDER_STATUS}" >&2
+  exit 1
+fi
+
+echo "two-party run completed"

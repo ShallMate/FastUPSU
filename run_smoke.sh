@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+export BUILD_FIRST="${BUILD_FIRST:-1}"
+export PSU_PROFILE="${PSU_PROFILE:-smoke}"
+export PSU_MEDIUM_NX="${PSU_MEDIUM_NX:-1024}"
+export PSU_MEDIUM_NY="${PSU_MEDIUM_NY:-64}"
+export PSU_MEDIUM_CAP="${PSU_MEDIUM_CAP:-16}"
+export PSU_SIMPLE_HASH_BINS="${PSU_SIMPLE_HASH_BINS:-82}"
+export PSU_THREADS="${PSU_THREADS:-4}"
+export PSU_OFFLINE_THREADS="${PSU_OFFLINE_THREADS:-4}"
+export PSU_ONLINE_THREADS="${PSU_ONLINE_THREADS:-2}"
+export PSU_OTE_BACKEND="${PSU_OTE_BACKEND:-iknp}"
+export PSU_PARTIES="${PSU_PARTIES:-127.0.0.1:19360,127.0.0.1:19361}"
+export PSU_PERM_ADDRESS="${PSU_PERM_ADDRESS:-127.0.0.1:19365}"
+export PSU_OTE_ADDRESS="${PSU_OTE_ADDRESS:-127.0.0.1:19370}"
+export PSU_PEQT_ADDRESS="${PSU_PEQT_ADDRESS:-127.0.0.1:19380}"
+export LOG_DIR="${LOG_DIR:-${ROOT}/logs/smoke}"
+
+exec "${ROOT}/run_two_party.sh"
