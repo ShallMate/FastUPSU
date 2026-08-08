@@ -26,7 +26,7 @@
   "ks": 4,
   "permutation_hashing": true,
   "circuit_peqt": true,
-  "drop_first_poly": true,
+  "drop_first_poly": false,
   "query_depth": 2,
   "ps_low_degree": 44,
   "ntt_plain_eval": true,

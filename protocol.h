@@ -43,7 +43,7 @@ struct ProtocolParams {
   size_t response_mod_switch_steps = 1;
   size_t response_flood_bits = 80;
   bool use_circuit_peqt = true;
-  bool drop_first_poly = true;
+  bool drop_first_poly = false;
   bool reveal_match_items = true;
 
   size_t PermutationIndexBits() const {
