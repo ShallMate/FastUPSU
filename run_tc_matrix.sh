@@ -139,9 +139,6 @@ Resume mode:
   Resume mode keeps existing summary files, skips cases already marked CORRECT,
   and rewrites the summary row for a case if that case is rerun.
 
-Note:
-  The current PSU implementation builds sender setup state on the fly.
-  Persistent prepared/intermediate cache files are not required.
 EOF
 }
 

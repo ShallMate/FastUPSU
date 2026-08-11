@@ -137,7 +137,7 @@ struct BinOteSenderInputs {
   std::vector<uint64_t> sender_values;
 };
 
-struct OlmtReceiverOutput {
+struct S3mtReceiverOutput {
   std::vector<uint8_t> choice_share;
   std::vector<uint64_t> aligned_values;
 };
@@ -151,15 +151,6 @@ void ProtocolSend(const std::shared_ptr<upsu::net::Context>& ctx,
 std::shared_ptr<PreparedSender> PrepareSender(
     const std::vector<std::string>& sender_items, const ProtocolParams& params);
 
-std::shared_ptr<PreparedSender> LoadPreparedSenderCache(
-    const std::string& path, const ProtocolParams& params,
-    const std::vector<std::string>& sender_items);
-
-void SavePreparedSenderCache(const std::string& path,
-                             const std::shared_ptr<PreparedSender>& prepared,
-                             const ProtocolParams& params,
-                             const std::vector<std::string>& sender_items);
-
 void MaterializeSenderOnlineCache(
     const std::shared_ptr<PreparedSender>& prepared,
     const ProtocolParams& params);
@@ -170,7 +161,7 @@ std::vector<uint8_t> SendPreparedDirectOteChoices(
     const ProtocolParams& params,
     OnlineStats* online_stats = nullptr);
 
-std::vector<uint8_t> RunOlmtSender(
+std::vector<uint8_t> RunS3mtSender(
     const std::shared_ptr<upsu::net::Context>& ctx,
     const std::shared_ptr<PreparedSender>& prepared,
     const ProtocolParams& params,
@@ -197,7 +188,7 @@ BinOteSenderInputs RecvDirectOteSenderInputs(
     const std::vector<std::string>& receiver_items, const ProtocolParams& params,
     OnlineStats* online_stats = nullptr);
 
-OlmtReceiverOutput RunOlmtReceiver(
+S3mtReceiverOutput RunS3mtReceiver(
     const std::shared_ptr<upsu::net::Context>& ctx,
     const std::vector<std::string>& receiver_items,
     const ProtocolParams& params,
@@ -210,8 +201,6 @@ std::vector<std::string> RecvItems(
     const std::shared_ptr<upsu::net::Context>& ctx,
     const std::vector<std::string>& receiver_items, const ProtocolParams& params,
     OnlineStats* online_stats = nullptr);
-
-bool SelfTestWindowedPowers(const ProtocolParams& params);
 
 size_t ComputePolyLinkHashBits(size_t sender_set_size, size_t receiver_set_size,
                           size_t lambda);

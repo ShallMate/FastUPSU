@@ -17,10 +17,10 @@ SENDER_LOG="${LOG_DIR}/sender.log"
 usage() {
   cat <<'EOF'
 Usage:
-  run_olmt_two_party.sh
+  run_s3mt_two_party.sh
 
-Runs the OSLMS module only:
-  sender setup + OSLMS online
+Runs the S³MT module only:
+  sender setup + S³MT online
   without the final EQ-OTE/value transfer stage.
 
 Optional environment overrides:
@@ -61,7 +61,7 @@ if [[ ! -x "${BIN}" ]]; then
   exit 1
 fi
 
-echo "Starting two-party OSLMS run"
+echo "Starting two-party S³MT run"
 echo "  bin:      ${BIN}"
 echo "  settings: ${SETTINGS_FILE}"
 if [[ -n "${PROFILE}" ]]; then
@@ -73,7 +73,7 @@ echo "  logs:     ${RECEIVER_LOG}, ${SENDER_LOG}"
 (
   cd "${PROJECT_ROOT}"
   env \
-    PSU_MODE=olmt-receiver \
+    PSU_MODE=s3mt-receiver \
     PSU_SETTINGS_FILE="${SETTINGS_FILE}" \
     PSU_PROFILE="${PROFILE}" \
     PSU_PARTIES="${PARTIES}" \
@@ -89,7 +89,7 @@ set +e
 (
   cd "${PROJECT_ROOT}"
   env \
-    PSU_MODE=olmt-sender \
+    PSU_MODE=s3mt-sender \
     PSU_SETTINGS_FILE="${SETTINGS_FILE}" \
     PSU_PROFILE="${PROFILE}" \
     PSU_PARTIES="${PARTIES}" \
@@ -103,8 +103,8 @@ RECEIVER_STATUS=$?
 set -e
 
 if [[ "${SENDER_STATUS}" -ne 0 || "${RECEIVER_STATUS}" -ne 0 ]]; then
-  echo "two-party OSLMS run failed: receiver=${RECEIVER_STATUS}, sender=${SENDER_STATUS}" >&2
+  echo "two-party S³MT run failed: receiver=${RECEIVER_STATUS}, sender=${SENDER_STATUS}" >&2
   exit 1
 fi
 
-echo "two-party OSLMS run completed"
+echo "two-party S³MT run completed"

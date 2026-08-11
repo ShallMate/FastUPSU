@@ -1,5 +1,5 @@
 
-#include "protocol.h"
+#include "unbalanced_psu.h"
 #include "upsu/common.h"
 #include "upsu/net/context.h"
 #include "upsu/parallel.h"
@@ -14,8 +14,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
-#include <filesystem>
-#include <fstream>
 #include <immintrin.h>
 #include <iostream>
 #include <limits>
@@ -40,7 +38,7 @@
 #include "cryptoTools/Crypto/PRNG.h"
 #include "coproto_asio_globals.h"
 #include "dh_oprf.h"
-#include "poly_links.h"
+#include "polynomial_links.h"
 #include "local_comm_stats.h"
 #include "peqt.h"
 #include "response_sanitizer.h"
@@ -58,10 +56,6 @@ constexpr const char* kRelinKeysTag = "UPSI:fhe_relin";
 constexpr const char* kQueryCiphertextTag = "UPSI:query_cts";
 constexpr const char* kEvalCiphertextTag = "UPSI:eval_cts";
 constexpr const char* kPeqtShareTag = "UPSI:peqt_shares";
-constexpr uint64_t kPreparedCacheMagic = 0x5543505349505245ULL;
-constexpr uint64_t kPreparedCacheVersion = 9;
-constexpr uint64_t kIntermediateCacheMagic = 0x5543505349494E54ULL;
-constexpr uint64_t kIntermediateCacheVersion = 3;
 
 bool TraceEnabled() {
   static const bool enabled = []() {
@@ -101,8 +95,6 @@ bool NttPlainEvalEnabled() {
   return lowered != "0" && lowered != "false" && lowered != "no" &&
          lowered != "off";
 }
-
-bool PersistentCacheEnabled() { return false; }
 
 size_t FieldBitWidth(uint64_t prime) {
   size_t bits = 0;
@@ -1093,114 +1085,6 @@ std::vector<uint64_t> DecodeSlots(const seal::Plaintext& pt,
   return out;
 }
 
-template <typename T>
-void WritePod(std::ostream& os, const T& value) {
-  os.write(reinterpret_cast<const char*>(&value), sizeof(T));
-  UPSU_ENFORCE(os.good(), "failed to write cache payload");
-}
-
-template <typename T>
-T ReadPod(std::istream& is) {
-  T value;
-  is.read(reinterpret_cast<char*>(&value), sizeof(T));
-  UPSU_ENFORCE(is.good(), "failed to read cache payload");
-  return value;
-}
-
-void WriteString(std::ostream& os, const std::string& value) {
-  WritePod<uint64_t>(os, static_cast<uint64_t>(value.size()));
-  os.write(value.data(), static_cast<std::streamsize>(value.size()));
-  UPSU_ENFORCE(os.good(), "failed to write cache string");
-}
-
-std::string ReadString(std::istream& is) {
-  const uint64_t size = ReadPod<uint64_t>(is);
-  std::string value(size, '\0');
-  is.read(value.data(), static_cast<std::streamsize>(size));
-  UPSU_ENFORCE(is.good(), "failed to read cache string");
-  return value;
-}
-
-std::string HexEncode(upsu::ByteView data) {
-  static constexpr char kHexDigits[] = "0123456789abcdef";
-  std::string out;
-  out.resize(data.size() * 2);
-  for (size_t i = 0; i < data.size(); ++i) {
-    const auto byte = static_cast<uint8_t>(data[i]);
-    out[2 * i] = kHexDigits[byte >> 4];
-    out[2 * i + 1] = kHexDigits[byte & 0x0F];
-  }
-  return out;
-}
-
-std::string BuildSenderItemsDigest(const std::vector<std::string>& sender_items) {
-  upsu::Hash256 hasher;
-  const uint64_t item_count = static_cast<uint64_t>(sender_items.size());
-  hasher.Update(upsu::Bytes(&item_count, sizeof(item_count)));
-  for (const auto& item : sender_items) {
-    const uint64_t item_size = static_cast<uint64_t>(item.size());
-    hasher.Update(upsu::Bytes(&item_size, sizeof(item_size)));
-    hasher.Update(item);
-  }
-  const auto digest = hasher.Final();
-  return HexEncode(upsu::Bytes(digest.data(), digest.size()));
-}
-
-std::string BuildPreparedCacheFingerprint(
-    const ProtocolParams& params, const std::vector<std::string>& sender_items) {
-  std::ostringstream oss;
-  oss << "sender_set_size=" << sender_items.size()
-      << "|sender_items_digest=" << BuildSenderItemsDigest(sender_items)
-      << "|kappa=" << params.kappa
-      << "|lambda=" << params.lambda
-      << "|poly_modulus_degree=" << params.poly_modulus_degree
-      << "|plain_modulus=" << params.plain_modulus
-      << "|sigma1_bits=" << params.sigma1_bits
-      << "|use_permutation_hashing=" << params.use_permutation_hashing
-      << "|drop_first_poly=" << params.drop_first_poly
-      << "|effective_item_bits=" << params.EffectiveItemBitCount()
-      << "|ks=" << params.ks
-      << "|sigma2_bits=" << params.sigma2_bits;
-  oss
-      << "|hash_func_count=" << params.hash_func_count
-      << "|cuckoo_scale=" << params.cuckoo_scale
-      << "|simple_hash_bins=" << params.simple_hash_bins
-      << "|alpha=" << params.alpha
-      << "|max_items_per_bin=" << params.max_items_per_bin
-      << "|query_powers_max_depth=" << params.query_powers_max_depth
-      << "|ps_low_degree=" << params.ps_low_degree
-      << "|coeff_modulus_bits=";
-  for (size_t i = 0; i < params.coeff_modulus_bits.size(); ++i) {
-    if (i) {
-      oss << ',';
-    }
-    oss << params.coeff_modulus_bits[i];
-  }
-  oss << "|query_powers=";
-  for (size_t i = 0; i < params.query_powers.size(); ++i) {
-    if (i) {
-      oss << ',';
-    }
-    oss << params.query_powers[i];
-  }
-  return oss.str();
-}
-
-std::string NormalizePreparedCacheFingerprint(std::string fingerprint) {
-  const std::string marker = "|response_mod_switch_steps=";
-  const size_t marker_pos = fingerprint.find(marker);
-  if (marker_pos == std::string::npos) {
-    return fingerprint;
-  }
-  const size_t next_field_pos = fingerprint.find('|', marker_pos + 1);
-  if (next_field_pos == std::string::npos) {
-    fingerprint.erase(marker_pos);
-  } else {
-    fingerprint.erase(marker_pos, next_field_pos - marker_pos);
-  }
-  return fingerprint;
-}
-
 size_t QueryCipherIndex(size_t batch_idx, size_t slice_idx,
                         size_t query_slice_count, size_t source_power_count,
                         size_t power_idx) {
@@ -1464,174 +1348,6 @@ struct SimpleHashTable {
     }
   }
 };
-
-[[maybe_unused]] std::string IntermediateCacheFilePath() {
-  if (!PersistentCacheEnabled()) {
-    return "";
-  }
-  const char* value = std::getenv("PSU_INTERMEDIATE_CACHE_FILE");
-  if (!value || !*value) {
-    return "";
-  }
-  return value;
-}
-
-std::string BuildIntermediateBaseFingerprint(
-    const std::vector<std::string>& sender_items) {
-  std::ostringstream oss;
-  oss << "sender_set_size=" << sender_items.size()
-      << "|sender_items_digest=" << BuildSenderItemsDigest(sender_items);
-  return oss.str();
-}
-
-std::string BuildIntermediateHashFingerprint(const ProtocolParams& params) {
-  std::ostringstream oss;
-  oss << "sigma1_bits=" << params.sigma1_bits
-      << "|use_permutation_hashing=" << params.use_permutation_hashing
-      << "|simple_hash_bins=" << params.simple_hash_bins;
-  return oss.str();
-}
-
-void WriteUint128(std::ostream& os, uint128_t value) {
-  const auto [hi, lo] = upsu::DecomposeUInt128(value);
-  WritePod<uint64_t>(os, hi);
-  WritePod<uint64_t>(os, lo);
-}
-
-uint128_t ReadUint128(std::istream& is) {
-  const uint64_t hi = ReadPod<uint64_t>(is);
-  const uint64_t lo = ReadPod<uint64_t>(is);
-  return upsu::MakeUint128(hi, lo);
-}
-
-void WriteSimpleHashTable(std::ostream& os, const SimpleHashTable& table) {
-  WritePod<uint64_t>(os, static_cast<uint64_t>(table.num_bins));
-  WritePod<uint64_t>(os, static_cast<uint64_t>(table.max_bin_size));
-  WritePod<uint8_t>(os, table.use_permutation_hashing ? 1 : 0);
-  WritePod<uint64_t>(os, static_cast<uint64_t>(table.permutation_index_bits));
-  WritePod<uint64_t>(os, static_cast<uint64_t>(table.bins.size()));
-  for (const auto& bin : table.bins) {
-    WritePod<uint64_t>(os, static_cast<uint64_t>(bin.size()));
-    for (uint128_t item : bin) {
-      WriteUint128(os, item);
-    }
-  }
-}
-
-SimpleHashTable ReadSimpleHashTable(std::istream& is) {
-  const size_t num_bins = static_cast<size_t>(ReadPod<uint64_t>(is));
-  const size_t max_bin_size = static_cast<size_t>(ReadPod<uint64_t>(is));
-  const bool use_permutation_hashing = ReadPod<uint8_t>(is) != 0;
-  const size_t permutation_index_bits =
-      static_cast<size_t>(ReadPod<uint64_t>(is));
-  const uint64_t stored_bin_count = ReadPod<uint64_t>(is);
-  UPSU_ENFORCE(stored_bin_count == num_bins,
-               "simple hash table bin-count mismatch: got {}, expect {}",
-               stored_bin_count, num_bins);
-  SimpleHashTable table(num_bins, use_permutation_hashing,
-                        permutation_index_bits);
-  table.max_bin_size = max_bin_size;
-  for (size_t bin_idx = 0; bin_idx < num_bins; ++bin_idx) {
-    const size_t bin_size = static_cast<size_t>(ReadPod<uint64_t>(is));
-    auto& bin = table.bins[bin_idx];
-    bin.resize(bin_size);
-    for (size_t item_idx = 0; item_idx < bin_size; ++item_idx) {
-      bin[item_idx] = ReadUint128(is);
-    }
-  }
-  return table;
-}
-
-struct SenderIntermediateCache {
-  DhOprf sender_oprf;
-  std::vector<uint128_t> x_oprf;
-  std::optional<std::string> hash_fingerprint;
-  std::optional<SimpleHashTable> sh_table;
-};
-
-[[maybe_unused]] std::optional<SenderIntermediateCache> LoadSenderIntermediateCache(
-    const std::string& path, const ProtocolParams& params,
-    const std::vector<std::string>& sender_items) {
-  if (path.empty() || !std::filesystem::exists(path)) {
-    return std::nullopt;
-  }
-
-  std::ifstream input(path, std::ios::binary);
-  if (!input.good()) {
-    return std::nullopt;
-  }
-
-  try {
-    const uint64_t magic = ReadPod<uint64_t>(input);
-    const uint64_t version = ReadPod<uint64_t>(input);
-    UPSU_ENFORCE(magic == kIntermediateCacheMagic,
-                 "intermediate cache magic mismatch");
-    UPSU_ENFORCE(version == kIntermediateCacheVersion,
-                 "intermediate cache version mismatch: got {}, expect {}",
-                 version, kIntermediateCacheVersion);
-    UPSU_ENFORCE(ReadString(input) ==
-                     BuildIntermediateBaseFingerprint(sender_items),
-                 "intermediate cache sender-set fingerprint mismatch");
-
-    SenderIntermediateCache cache;
-    cache.sender_oprf.DeserializeSecretKey(ReadString(input));
-    const size_t x_oprf_count = static_cast<size_t>(ReadPod<uint64_t>(input));
-    UPSU_ENFORCE(x_oprf_count == sender_items.size(),
-                 "intermediate cache x_oprf size mismatch: got {}, expect {}",
-                 x_oprf_count, sender_items.size());
-    cache.x_oprf.resize(x_oprf_count);
-    for (size_t i = 0; i < x_oprf_count; ++i) {
-      cache.x_oprf[i] = ReadUint128(input);
-    }
-    const bool has_hash_stage = ReadPod<uint8_t>(input) != 0;
-    if (has_hash_stage) {
-      const std::string hash_fingerprint = ReadString(input);
-      SimpleHashTable sh_table = ReadSimpleHashTable(input);
-      if (hash_fingerprint == BuildIntermediateHashFingerprint(params)) {
-        cache.hash_fingerprint = std::move(hash_fingerprint);
-        cache.sh_table = std::move(sh_table);
-      }
-    }
-    return cache;
-  } catch (const std::exception& ex) {
-    TraceStage("cache", std::string("failed to load sender intermediate cache: ") +
-                            ex.what());
-    return std::nullopt;
-  }
-}
-
-[[maybe_unused]] void SaveSenderIntermediateCache(
-    const std::string& path, const DhOprf& sender_oprf,
-    const std::vector<uint128_t>& x_oprf, const ProtocolParams& params,
-    const SimpleHashTable& sh_table,
-    const std::vector<std::string>& sender_items) {
-  if (path.empty()) {
-    return;
-  }
-
-  const std::filesystem::path cache_path(path);
-  if (cache_path.has_parent_path()) {
-    std::filesystem::create_directories(cache_path.parent_path());
-  }
-
-  std::ofstream output(path, std::ios::binary | std::ios::trunc);
-  UPSU_ENFORCE(output.good(), "failed to open intermediate cache file: {}",
-               path);
-
-  WritePod<uint64_t>(output, kIntermediateCacheMagic);
-  WritePod<uint64_t>(output, kIntermediateCacheVersion);
-  WriteString(output, BuildIntermediateBaseFingerprint(sender_items));
-  const auto sender_sk = sender_oprf.SerializeSecretKey();
-  WriteString(output,
-              std::string(reinterpret_cast<const char*>(sender_sk.data()), sender_sk.size()));
-  WritePod<uint64_t>(output, static_cast<uint64_t>(x_oprf.size()));
-  for (uint128_t value : x_oprf) {
-    WriteUint128(output, value);
-  }
-  WritePod<uint8_t>(output, 1);
-  WriteString(output, BuildIntermediateHashFingerprint(params));
-  WriteSimpleHashTable(output, sh_table);
-}
 
 struct BinPolySet {
   std::vector<std::vector<uint64_t>> poly_coeffs;
@@ -2777,197 +2493,6 @@ std::shared_ptr<PreparedSender> PrepareSender(
   return prepared;
 }
 
-std::shared_ptr<PreparedSender> LoadPreparedSenderCache(
-    const std::string& path, const ProtocolParams& params,
-    const std::vector<std::string>& sender_items) {
-  if (!PersistentCacheEnabled()) {
-    return nullptr;
-  }
-  if (path.empty() || !std::filesystem::exists(path)) {
-    return nullptr;
-  }
-  if (SyntheticOnlineEnabled()) {
-    return nullptr;
-  }
-
-  std::ifstream input(path, std::ios::binary);
-  if (!input.good()) {
-    return nullptr;
-  }
-
-  try {
-    const uint64_t magic = ReadPod<uint64_t>(input);
-    const uint64_t version = ReadPod<uint64_t>(input);
-    UPSU_ENFORCE(magic == kPreparedCacheMagic,
-                 "prepared cache magic mismatch");
-    UPSU_ENFORCE(version == kPreparedCacheVersion,
-                 "prepared cache version mismatch: got {}, expect {}",
-                 version, kPreparedCacheVersion);
-
-    const std::string expected_fingerprint =
-        BuildPreparedCacheFingerprint(params, sender_items);
-    const std::string cached_fingerprint = ReadString(input);
-    UPSU_ENFORCE(NormalizePreparedCacheFingerprint(cached_fingerprint) ==
-                     NormalizePreparedCacheFingerprint(expected_fingerprint),
-                 "prepared cache fingerprint mismatch");
-
-    auto prepared = std::make_shared<PreparedSender>();
-    prepared->sender_oprf.DeserializeSecretKey(ReadString(input));
-    prepared->ks = ReadPod<uint64_t>(input);
-    prepared->sigma2_bits = ReadPod<uint64_t>(input);
-    prepared->item_bit_count = ReadPod<uint64_t>(input);
-    prepared->alpha_eff = ReadPod<uint64_t>(input);
-    prepared->max_degree = ReadPod<uint64_t>(input);
-    prepared->ps_low_degree = ReadPod<uint64_t>(input);
-    prepared->m = ReadPod<uint64_t>(input);
-
-    const uint64_t source_count = ReadPod<uint64_t>(input);
-    prepared->source_power_vec.resize(source_count);
-    for (uint64_t i = 0; i < source_count; ++i) {
-      prepared->source_power_vec[i] = ReadPod<uint32_t>(input);
-    }
-
-    const uint64_t target_count = ReadPod<uint64_t>(input);
-    for (uint64_t i = 0; i < target_count; ++i) {
-      prepared->target_powers.insert(ReadPod<uint32_t>(input));
-    }
-
-    auto context = CreateBfvContext(params);
-    const uint64_t batch_count = ReadPod<uint64_t>(input);
-    prepared->packed_plaintexts_online_ready = ReadPod<uint8_t>(input) != 0;
-    prepared->packed_bin_plaintexts.resize(batch_count);
-    for (uint64_t batch_idx = 0; batch_idx < batch_count; ++batch_idx) {
-      prepared->packed_bin_plaintexts[batch_idx].resize(prepared->alpha_eff);
-      for (size_t sub_idx = 0; sub_idx < prepared->alpha_eff; ++sub_idx) {
-        auto& packed = prepared->packed_bin_plaintexts[batch_idx][sub_idx];
-        packed.coeff_plaintexts.resize(prepared->ks);
-        packed.coeff_plaintexts_ntt.resize(prepared->ks);
-        packed.has_coeff_plaintexts.resize(prepared->ks);
-        bool has_ntt_coeff = false;
-        for (size_t output_slice = 0; output_slice < prepared->ks;
-             ++output_slice) {
-          packed.coeff_plaintexts[output_slice].resize(prepared->max_degree + 1);
-          packed.coeff_plaintexts_ntt[output_slice].resize(
-              prepared->max_degree + 1);
-          packed.has_coeff_plaintexts[output_slice].assign(
-              prepared->max_degree + 1, 0);
-          for (size_t degree = 0; degree <= prepared->max_degree; ++degree) {
-            const uint8_t coeff_storage = ReadPod<uint8_t>(input);
-            packed.has_coeff_plaintexts[output_slice][degree] =
-                (coeff_storage != 0);
-            if (coeff_storage == 0) {
-              continue;
-            }
-            if (coeff_storage == 1) {
-              packed.coeff_plaintexts[output_slice][degree] =
-                  DeserializeSealObject<seal::Plaintext>(context,
-                                                         ReadString(input));
-            } else if (coeff_storage == 2) {
-              packed.coeff_plaintexts_ntt[output_slice][degree] =
-                  DeserializeSealObject<seal::Plaintext>(context,
-                                                         ReadString(input));
-              has_ntt_coeff = true;
-            } else {
-              UPSU_THROW("invalid coeff storage tag {}", coeff_storage);
-            }
-          }
-        }
-        packed.non_constant_ntt = has_ntt_coeff;
-        RebuildPackedDegreeIndex(&packed, prepared->ks, prepared->max_degree);
-      }
-    }
-
-    return prepared;
-  } catch (const std::exception& ex) {
-    TraceStage("cache", std::string("failed to load prepared sender cache: ") +
-                            ex.what());
-    return nullptr;
-  }
-}
-
-void SavePreparedSenderCache(const std::string& path,
-                             const std::shared_ptr<PreparedSender>& prepared,
-                             const ProtocolParams& params,
-                             const std::vector<std::string>& sender_items) {
-  if (!PersistentCacheEnabled()) {
-    return;
-  }
-  if (path.empty() || !prepared || SyntheticOnlineEnabled()) {
-    return;
-  }
-  UPSU_ENFORCE(!prepared->packed_bin_plaintexts.empty(),
-               "prepared sender cache requires packed plaintexts");
-
-  const std::filesystem::path cache_path(path);
-  if (cache_path.has_parent_path()) {
-    std::filesystem::create_directories(cache_path.parent_path());
-  }
-
-  std::ofstream output(path, std::ios::binary | std::ios::trunc);
-  UPSU_ENFORCE(output.good(), "failed to open prepared cache file: {}", path);
-
-  WritePod<uint64_t>(output, kPreparedCacheMagic);
-  WritePod<uint64_t>(output, kPreparedCacheVersion);
-  WriteString(output, BuildPreparedCacheFingerprint(params, sender_items));
-  const auto sender_sk = prepared->sender_oprf.SerializeSecretKey();
-  WriteString(output,
-              std::string(reinterpret_cast<const char*>(sender_sk.data()), sender_sk.size()));
-  WritePod<uint64_t>(output, static_cast<uint64_t>(prepared->ks));
-  WritePod<uint64_t>(output, static_cast<uint64_t>(prepared->sigma2_bits));
-  WritePod<uint64_t>(output, static_cast<uint64_t>(prepared->item_bit_count));
-  WritePod<uint64_t>(output, static_cast<uint64_t>(prepared->alpha_eff));
-  WritePod<uint64_t>(output, static_cast<uint64_t>(prepared->max_degree));
-  WritePod<uint64_t>(output, static_cast<uint64_t>(prepared->ps_low_degree));
-  WritePod<uint64_t>(output, static_cast<uint64_t>(prepared->m));
-
-  WritePod<uint64_t>(output,
-                     static_cast<uint64_t>(prepared->source_power_vec.size()));
-  for (uint32_t power : prepared->source_power_vec) {
-    WritePod<uint32_t>(output, power);
-  }
-
-  WritePod<uint64_t>(output,
-                     static_cast<uint64_t>(prepared->target_powers.size()));
-  for (uint32_t power : prepared->target_powers) {
-    WritePod<uint32_t>(output, power);
-  }
-
-  WritePod<uint64_t>(output, prepared->packed_bin_plaintexts.size());
-  WritePod<uint8_t>(output,
-                    prepared->packed_plaintexts_online_ready ? 1 : 0);
-  for (const auto& batch : prepared->packed_bin_plaintexts) {
-    for (const auto& packed : batch) {
-      for (size_t output_slice = 0; output_slice < prepared->ks;
-           ++output_slice) {
-        for (size_t degree = 0; degree <= prepared->max_degree; ++degree) {
-          const bool has_plaintext =
-              packed.has_coeff_plaintexts[output_slice][degree] != 0;
-          if (!has_plaintext) {
-            WritePod<uint8_t>(output, 0);
-            continue;
-          }
-          const bool stored_as_ntt =
-              packed.non_constant_ntt &&
-              degree < packed.coeff_plaintexts_ntt[output_slice].size() &&
-              packed.coeff_plaintexts_ntt[output_slice][degree].coeff_count() >
-                  0;
-          WritePod<uint8_t>(output, stored_as_ntt ? 2 : 1);
-          if (stored_as_ntt) {
-            WriteString(
-                output,
-                SerializeSealObject(
-                    packed.coeff_plaintexts_ntt[output_slice][degree]));
-          } else {
-            WriteString(output, SerializeSealObject(
-                                    packed.coeff_plaintexts[output_slice]
-                                                          [degree]));
-          }
-        }
-      }
-    }
-  }
-}
-
 std::optional<std::vector<uint8_t>> SendPreparedImpl(
     const std::shared_ptr<upsu::net::Context>& ctx,
     const std::shared_ptr<PreparedSender>& prepared,
@@ -3323,7 +2848,7 @@ std::vector<uint8_t> SendPreparedDirectOteChoices(
   return std::move(*maybe_share);
 }
 
-std::vector<uint8_t> RunOlmtSender(
+std::vector<uint8_t> RunS3mtSender(
     const std::shared_ptr<upsu::net::Context>& ctx,
     const std::shared_ptr<PreparedSender>& prepared,
     const ProtocolParams& params, OnlineStats* online_stats) {
@@ -3915,13 +3440,13 @@ BinOteSenderInputs RecvDirectOteSenderInputs(
       .direct_ote_inputs;
 }
 
-OlmtReceiverOutput RunOlmtReceiver(
+S3mtReceiverOutput RunS3mtReceiver(
     const std::shared_ptr<upsu::net::Context>& ctx,
     const std::vector<std::string>& receiver_items, const ProtocolParams& params,
     OnlineStats* online_stats) {
   auto direct = RecvDirectOteSenderInputs(ctx, receiver_items, params,
                                           online_stats);
-  OlmtReceiverOutput output;
+  S3mtReceiverOutput output;
   output.choice_share = std::move(direct.sender_share);
   output.aligned_values = std::move(direct.sender_values);
   return output;
@@ -4182,84 +3707,4 @@ PrimitiveBenchMetrics RunLocalRandomPermutationBench(size_t n,
   return metrics;
 }
 
-bool SelfTestWindowedPowers(const ProtocolParams& params) {
-  const std::vector<size_t> max_degrees = {11, 12, 17, 52};
-  const std::vector<uint64_t> bases = {887, 941, 997, 1023};
-
-  for (size_t max_degree : max_degrees) {
-    auto context = CreateBfvContext(params);
-    seal::KeyGenerator keygen(*context);
-    auto secret_key = keygen.secret_key();
-    seal::PublicKey public_key;
-    keygen.create_public_key(public_key);
-    seal::RelinKeys relin_keys;
-    keygen.create_relin_keys(relin_keys);
-    auto relin_blob = SerializeSealObject(relin_keys);
-    relin_keys = DeserializeSealObject<seal::RelinKeys>(context, relin_blob);
-
-    seal::BatchEncoder encoder(*context);
-    seal::Encryptor encryptor(*context, public_key);
-    seal::Evaluator evaluator(*context);
-    seal::Decryptor decryptor(*context, secret_key);
-
-    const size_t ps_low_degree =
-        ChoosePsLowDegree(max_degree, params.ps_low_degree);
-    const auto target_powers = BuildTargetPowerSet(max_degree, ps_low_degree);
-    const auto source_powers = BuildSourcePowerSet(
-        target_powers, params.query_powers_max_depth, params.query_powers);
-    const auto source_power_vec = ToSortedVector(source_powers);
-    std::vector<seal::Ciphertext> source_ciphertexts;
-    source_ciphertexts.reserve(source_power_vec.size());
-
-    for (uint32_t target_power : source_power_vec) {
-      std::vector<uint64_t> power_values(bases.size(), 1ULL);
-      for (size_t slot_idx = 0; slot_idx < bases.size(); ++slot_idx) {
-        for (uint32_t d = 0; d < target_power; ++d) {
-          power_values[slot_idx] =
-              (d == 0)
-                  ? bases[slot_idx]
-                  : MulMod(power_values[slot_idx], bases[slot_idx],
-                           params.plain_modulus);
-        }
-      }
-      auto pt = EncodeSlots(encoder, power_values, params.plain_modulus);
-      seal::Ciphertext ct;
-      encryptor.encrypt(pt, ct);
-      auto ct_blob = SerializeSealObject(ct);
-      source_ciphertexts.push_back(
-          DeserializeSealObject<seal::Ciphertext>(context, ct_blob));
-    }
-
-    auto all_powers = ComputeAllPowersFromSources(
-        source_ciphertexts, source_power_vec, target_powers, relin_keys,
-        evaluator);
-
-    for (uint32_t d : target_powers) {
-      seal::Plaintext dec_pt;
-      decryptor.decrypt(all_powers[d], dec_pt);
-      auto decoded =
-          DecodeSlots(dec_pt, encoder, bases.size(), params.plain_modulus);
-      for (size_t slot_idx = 0; slot_idx < bases.size(); ++slot_idx) {
-        uint64_t expected = 1;
-        for (size_t step = 0; step < d; ++step) {
-          expected =
-              (step == 0)
-                  ? bases[slot_idx]
-                  : MulMod(expected, bases[slot_idx], params.plain_modulus);
-        }
-        if (decoded[slot_idx] != expected) {
-          std::cout << "  Windowed power self-test failed at max_degree "
-                    << max_degree << ", degree " << d << ", slot "
-                    << slot_idx << ": got " << decoded[slot_idx]
-                    << ", expect " << expected << ", W={"
-                    << JoinPowers(source_power_vec) << "}" << std::endl;
-          return false;
-        }
-      }
-    }
-  }
-  std::cout << "  Windowed power self-test: PASS"
-            << " (depth=" << params.query_powers_max_depth << ")" << std::endl;
-  return true;
-}
 }

@@ -19,15 +19,11 @@ usage() {
 Usage:
   run_two_party.sh
 
-The current PSU implementation builds sender setup state on the fly.
-Persistent prepared/intermediate cache files are not required.
-
 Optional environment overrides:
   BUILD_FIRST=0|1
   BIN=/abs/path/to/psu_binary
   PSU_SETTINGS_FILE=/abs/path/to/settings.json
   PSU_PROFILE=x20_y10
-  PSU_CACHE_TAG=pm4096_try1
   PSU_PARTIES=127.0.0.1:9300,127.0.0.1:9301
   PSU_ONLINE_THREADS=1
   PSU_MEDIUM_NX=16777216
@@ -38,7 +34,7 @@ Optional environment overrides:
 
 Examples:
   PSU_PROFILE=x20_y10 run_two_party.sh
-  PSU_PROFILE=x22_y14 PSU_CACHE_TAG=pm8192_try1 run_two_party.sh
+  PSU_PROFILE=x22_y14 run_two_party.sh
   PSU_PROFILE=x24_y12 PSU_ONLINE_THREADS=1 run_two_party.sh
 EOF
 }
@@ -72,9 +68,6 @@ echo "  bin:      ${BIN}"
 echo "  settings: ${SETTINGS_FILE}"
 if [[ -n "${PROFILE}" ]]; then
   echo "  profile:  ${PROFILE}"
-fi
-if [[ -n "${PSU_CACHE_TAG:-}" ]]; then
-echo "  cache tag:${PSU_CACHE_TAG}"
 fi
 echo "  parties:  ${PARTIES}"
 echo "  logs:     ${RECEIVER_LOG}, ${SENDER_LOG}"

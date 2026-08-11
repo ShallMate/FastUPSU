@@ -8,7 +8,7 @@ source "${PROJECT_ROOT}/scripts/common.sh"
 BIN="${BIN:-${BUILD_DIR}/psu}"
 BUILD_FIRST="${BUILD_FIRST:-1}"
 OUT_ROOT="${OUT_ROOT:-${SCRIPT_DIR}/net_eval}"
-RUN_ID="${RUN_ID:-random_permutation_$(date +%Y%m%d_%H%M%S)}"
+RUN_ID="${RUN_ID:-online_permutation_$(date +%Y%m%d_%H%M%S)}"
 RUN_ROOT="${OUT_ROOT}/${RUN_ID}"
 SUMMARY_FILE="${RUN_ROOT}/summary.tsv"
 CORE_CSV_FILE="${RUN_ROOT}/core_metrics.csv"
@@ -44,10 +44,10 @@ SCENARIO_DELAY=(
 usage() {
   cat <<'EOF'
 Usage:
-  run_random_permutation_matrix.sh
+  run_online_permutation_matrix.sh
 
-This script benchmarks the random permutation primitive only.
-It does not run UPSU sender setup, table building, or PolyLinks evaluation.
+This script benchmarks the online-efficient secret-shared permutation only.
+It does not run PSU sender setup, table building, or Polynomial Links.
 
 Default sweep:
   scenarios in {10gbps_0p05ms, 100mbps_80ms, 10mbps_80ms, 1mbps_80ms}
@@ -57,7 +57,7 @@ Optional environment overrides:
   BUILD_FIRST=0
   BIN=/abs/path/to/psu
   OUT_ROOT=net_eval
-  RUN_ID=random_perm_try1
+  RUN_ID=online_perm_try1
   TC_SCENARIOS=10mbps_80ms,1mbps_80ms
   N_POWERS_CSV=11,12,13,14
   PSU_PERM_BLOCK_SIZE=1

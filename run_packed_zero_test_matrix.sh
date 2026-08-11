@@ -47,7 +47,7 @@ Usage:
   run_packed_zero_test_matrix.sh
 
 This script benchmarks the packed zero-test primitive only.
-It does not run UPSU sender setup, table building, or PolyLinks evaluation.
+It does not run PSU sender setup, table building, or Polynomial Links.
 
 Default sweep:
   scenarios in {10gbps_0p05ms, 100mbps_80ms, 10mbps_80ms, 1mbps_80ms}

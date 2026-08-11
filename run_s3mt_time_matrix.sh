@@ -44,16 +44,16 @@ filter_profiles() {
 usage() {
   cat <<'EOF'
 Usage:
-  run_olmt_time_matrix.sh
+  run_s3mt_time_matrix.sh
 
 This script:
-1. runs the OSLMS/OLMT two-party benchmark locally,
+1. runs the S³MT two-party benchmark locally,
 2. sweeps X in {2^22, 2^24} and Y in {2^11, 2^12, 2^13, 2^14},
 3. records offline time, online time, and total time (= offline + online),
 4. stores per-run logs under net_eval/<timestamp>/.
 
 Optional environment overrides:
-  RUN_ID=olmt_time_sweep
+  RUN_ID=s3mt_time_sweep
   BUILD_FIRST=0
   PSU_PROFILES=x22_y12,x24_y14
   OUT_ROOT=net_eval
@@ -184,7 +184,7 @@ for profile in "${PROFILES[@]}"; do
       LOG_DIR="${log_dir}" \
       PSU_SETTINGS_FILE="${SETTINGS_FILE}" \
       PSU_PROFILE="${profile}" \
-      "${SCRIPT_DIR}/run_olmt_two_party.sh"
+      "${SCRIPT_DIR}/run_s3mt_two_party.sh"
   ) |& tee "${console_log}"
 
   receiver_log="${log_dir}/receiver.log"
@@ -213,6 +213,6 @@ for profile in "${PROFILES[@]}"; do
     "${offline_time}" "${online_time}" "${total_time}" >> "${CORE_CSV_FILE}"
 done
 
-echo "all OSLMS local time runs completed"
+echo "all S³MT local time runs completed"
 echo "summary: ${SUMMARY_FILE}"
 echo "core metrics: ${CORE_CSV_FILE}"

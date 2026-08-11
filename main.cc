@@ -17,13 +17,12 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <unordered_set>
 #include <vector>
 
 #include "upsu/powers_dag.h"
-#include "ote.h"
-#include "poly_links.h"
-#include "protocol.h"
+#include "eqote.h"
+#include "polynomial_links.h"
+#include "unbalanced_psu.h"
 #include "seal/modulus.h"
 
 using namespace psu;
@@ -157,64 +156,6 @@ std::vector<std::string> ParseJsonStringArray(const std::string& array_body) {
   return result;
 }
 
-std::string ReplaceAllCopy(std::string text, const std::string& from,
-                           const std::string& to) {
-  if (from.empty()) {
-    return text;
-  }
-  size_t pos = 0;
-  while ((pos = text.find(from, pos)) != std::string::npos) {
-    text.replace(pos, from.size(), to);
-    pos += to.size();
-  }
-  return text;
-}
-
-std::string SanitizePathComponent(std::string value) {
-  if (value.empty()) {
-    return value;
-  }
-  for (char& ch : value) {
-    const bool keep =
-        (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
-        (ch >= '0' && ch <= '9') || ch == '.' || ch == '_' || ch == '-';
-    if (!keep) {
-      ch = '_';
-    }
-  }
-  return value;
-}
-
-void ExpandTemplateEnv(const char* name, const std::string& profile) {
-  const char* raw = std::getenv(name);
-  if (!raw || !*raw) {
-    return;
-  }
-  std::string value(raw);
-  std::string cache_tag =
-      GetEnvString("PSU_CACHE_TAG",
-                   GetEnvString("PSU_FHE_CANDIDATE"));
-  cache_tag = SanitizePathComponent(cache_tag);
-  value = ReplaceAllCopy(value, "{profile}",
-                         profile.empty() ? "default" : profile);
-  value = ReplaceAllCopy(value, "{candidate}",
-                         cache_tag.empty() ? "default" : cache_tag);
-  value = ReplaceAllCopy(value, "{cache_tag}",
-                         cache_tag.empty() ? "default" : cache_tag);
-  value = ReplaceAllCopy(value, "{candidate_suffix}",
-                         cache_tag.empty() ? "" : ("/" + cache_tag));
-  value = ReplaceAllCopy(
-      value, "{nx}",
-      GetEnvString("PSU_MEDIUM_NX", "0"));
-  value = ReplaceAllCopy(
-      value, "{ny}",
-      GetEnvString("PSU_MEDIUM_NY", "0"));
-  value = ReplaceAllCopy(
-      value, "{cap}",
-      GetEnvString("PSU_MEDIUM_CAP", "0"));
-  setenv(name, value.c_str(), 1);
-}
-
 void ApplySettingsBlock(const std::string& json, const std::string& key_prefix,
                         bool overwrite_existing = false) {
   auto prefixed = [&](const char* key) {
@@ -259,9 +200,6 @@ void ApplySettingsBlock(const std::string& json, const std::string& key_prefix,
   apply_string(prefixed("bench_filter"), "PSU_BENCH_FILTER");
   apply_string(prefixed("mode"), "PSU_MODE");
   apply_string(prefixed("parties"), "PSU_PARTIES");
-  apply_string(prefixed("prepared_cache_file"), "PSU_PREPARED_CACHE_FILE");
-  apply_string(prefixed("intermediate_cache_file"),
-               "PSU_INTERMEDIATE_CACHE_FILE");
   apply_scalar(prefixed("threads"), "PSU_THREADS");
   apply_scalar(prefixed("offline_threads"), "PSU_OFFLINE_THREADS");
   apply_scalar(prefixed("online_threads"), "PSU_ONLINE_THREADS");
@@ -342,9 +280,6 @@ void ApplyFheCandidateBlock(const std::string& candidate_name) {
   }
   setenv("PSU_FHE_CANDIDATE", candidate_name.c_str(), 1);
   ApplySettingsBlock(json, "candidate_" + candidate_name + "_", true);
-  const std::string profile = GetEnvString("PSU_PROFILE");
-  ExpandTemplateEnv("PSU_PREPARED_CACHE_FILE", profile);
-  ExpandTemplateEnv("PSU_INTERMEDIATE_CACHE_FILE", profile);
 }
 
 void ApplySettingsJson() {
@@ -368,8 +303,6 @@ void ApplySettingsJson() {
   if (!candidate.empty()) {
     ApplyFheCandidateBlock(candidate);
   }
-  ExpandTemplateEnv("PSU_PREPARED_CACHE_FILE", profile);
-  ExpandTemplateEnv("PSU_INTERMEDIATE_CACHE_FILE", profile);
 }
 
 std::vector<int> ParseIntListEnv(const char* name) {
@@ -408,16 +341,6 @@ std::vector<uint32_t> ParseQueryPowersEnv(const char* name) {
   return result;
 }
 
-bool ShouldRunBenchmark(const std::string& name) {
-  const char* filter = std::getenv("PSU_BENCH_FILTER");
-  if (!filter || !*filter) {
-    return true;
-  }
-  if (*filter == '=') {
-    return name == (filter + 1);
-  }
-  return name.find(filter) != std::string::npos;
-}
 
 std::vector<std::string> SplitCsv(const std::string& csv) {
   std::vector<std::string> result;
@@ -466,22 +389,6 @@ void PrintOutputItems(const std::vector<std::string>& items) {
   std::cout << "  Output preview:      " << oss.str() << std::endl;
 }
 
-size_t TrueIntersectionSize(const std::vector<std::string>& x,
-                             const std::vector<std::string>& y) {
-  std::unordered_set<std::string> sx(x.begin(), x.end());
-  size_t count = 0;
-  for (const auto& yi : y) {
-    if (sx.count(yi)) ++count;
-  }
-  return count;
-}
-
-size_t TrueUnionSize(const std::vector<std::string>& x,
-                     const std::vector<std::string>& y) {
-  std::unordered_set<std::string> s(x.begin(), x.end());
-  s.insert(y.begin(), y.end());
-  return s.size();
-}
 
 std::vector<uint8_t> SampleRandomBits(size_t n) {
   std::vector<uint8_t> out(n, 0);
@@ -492,190 +399,6 @@ std::vector<uint8_t> SampleRandomBits(size_t n) {
 }
 
 
-static void PrintStats(const std::string& name,
-                       const std::shared_ptr<upsu::net::Context>& ctx0,
-                       const std::shared_ptr<upsu::net::Context>& ctx1,
-                       double elapsed_s, size_t cardinality,
-                       size_t true_cardinality,
-                       double receiver_offline_s = -1.0,
-                       double end_to_end_s = -1.0,
-                       bool timing_only = false,
-                       size_t fhe_key_comm_bytes = 0,
-                       double setup_time_s = -1.0,
-                       double online_wall_time_s = -1.0,
-                       double perm_setup_time_s = -1.0,
-                       double peqt_setup_time_s = -1.0,
-                       double perm_apply_time_s = -1.0,
-                       double peqt_time_s = -1.0,
-                       size_t perm_setup_comm_bytes = 0,
-                       size_t peqt_setup_comm_bytes = 0,
-                       size_t perm_apply_comm_bytes = 0,
-                       size_t peqt_comm_bytes = 0,
-                       size_t peqt_local_comm_bytes = 0,
-                       size_t ote_comm_bytes = 0) {
-  auto bytesToMB = [](size_t bytes) -> double {
-    return static_cast<double>(bytes) / (1024.0 * 1024.0);
-  };
-  auto s0 = ctx0->GetStats();
-  auto s1 = ctx1->GetStats();
-  const size_t total_link_comm_bytes =
-      s0->sent_bytes.load() + s0->recv_bytes.load();
-  const size_t setup_comm_bytes =
-      fhe_key_comm_bytes + perm_setup_comm_bytes + peqt_setup_comm_bytes;
-  const size_t total_comm_bytes =
-      total_link_comm_bytes + peqt_setup_comm_bytes + peqt_local_comm_bytes +
-      ote_comm_bytes + perm_setup_comm_bytes + perm_apply_comm_bytes;
-  const size_t online_link_comm_bytes =
-      (total_link_comm_bytes >= fhe_key_comm_bytes)
-          ? (total_link_comm_bytes - fhe_key_comm_bytes)
-          : 0;
-  const size_t online_comm_bytes =
-      online_link_comm_bytes + peqt_local_comm_bytes + ote_comm_bytes +
-      perm_apply_comm_bytes;
-  const size_t fhe_query_response_comm_bytes =
-      (online_comm_bytes >= peqt_comm_bytes + ote_comm_bytes + perm_apply_comm_bytes)
-          ? (online_comm_bytes - peqt_comm_bytes - ote_comm_bytes -
-             perm_apply_comm_bytes)
-          : 0;
-  const double total_comm_mb = bytesToMB(total_comm_bytes);
-  const double online_comm_mb = bytesToMB(online_comm_bytes);
-  const double setup_comm_mb = bytesToMB(setup_comm_bytes);
-  const double fhe_key_comm_mb = bytesToMB(fhe_key_comm_bytes);
-  const double fhe_query_response_comm_mb =
-      bytesToMB(fhe_query_response_comm_bytes);
-  const double setup_prep_time_s = receiver_offline_s >= 0.0 ? receiver_offline_s : 0.0;
-  const double setup_total_time_s =
-      (setup_prep_time_s > 0.0 ? setup_prep_time_s : 0.0) +
-      (setup_time_s > 0.0 ? setup_time_s : 0.0);
-
-  std::cout << "==============================" << std::endl;
-  std::cout << "[" << name << "]" << std::endl;
-  if (receiver_offline_s >= 0.0) {
-    if (setup_prep_time_s > 0.0) {
-      std::cout << "  Setup prep time:   " << setup_prep_time_s << " s"
-                << std::endl;
-    }
-    if (setup_total_time_s > 0.0) {
-      std::cout << "  Setup time:        " << setup_total_time_s << " s"
-                << std::endl;
-    } else if (setup_time_s > 0.0) {
-      std::cout << "  Setup time:        " << setup_time_s << " s"
-                << std::endl;
-    }
-    if (setup_time_s > 0.0) {
-      std::cout << "  Setup online time: " << setup_time_s << " s"
-                << std::endl;
-    }
-    if (perm_setup_time_s > 0.0) {
-      std::cout << "  Perm setup time:   " << perm_setup_time_s << " s"
-                << std::endl;
-    }
-    if (peqt_setup_time_s > 0.0) {
-      std::cout << "  PEQT setup time:   " << peqt_setup_time_s << " s"
-                << std::endl;
-    }
-    if (peqt_time_s > 0.0) {
-      std::cout << "  PEQT time:         " << peqt_time_s << " s"
-                << std::endl;
-    }
-    if (perm_apply_time_s > 0.0) {
-      std::cout << "  Perm online time:  " << perm_apply_time_s << " s"
-                << std::endl;
-    }
-    std::cout << "  Online time:       " << elapsed_s << " s" << std::endl;
-    if (online_wall_time_s >= 0.0) {
-      std::cout << "  Online wall:       " << online_wall_time_s << " s"
-                << std::endl;
-    }
-    if (end_to_end_s >= 0.0) {
-      std::cout << "  End-to-end:        " << end_to_end_s << " s"
-                << std::endl;
-    }
-  } else {
-    if (setup_total_time_s > 0.0) {
-      std::cout << "  Setup time:        " << setup_total_time_s << " s"
-                << std::endl;
-    } else if (setup_time_s > 0.0) {
-      std::cout << "  Setup time:        " << setup_time_s << " s"
-                << std::endl;
-    }
-    if (perm_setup_time_s > 0.0) {
-      std::cout << "  Perm setup time:   " << perm_setup_time_s << " s"
-                << std::endl;
-    }
-    if (peqt_setup_time_s > 0.0) {
-      std::cout << "  PEQT setup time:   " << peqt_setup_time_s << " s"
-                << std::endl;
-    }
-    if (peqt_time_s > 0.0) {
-      std::cout << "  PEQT time:         " << peqt_time_s << " s"
-                << std::endl;
-    }
-    if (perm_apply_time_s > 0.0) {
-      std::cout << "  Perm online time:  " << perm_apply_time_s << " s"
-                << std::endl;
-    }
-    std::cout << "  Time:              " << elapsed_s << " s" << std::endl;
-    if (online_wall_time_s >= 0.0) {
-      std::cout << "  Online wall:       " << online_wall_time_s << " s"
-                << std::endl;
-    }
-  }
-  std::cout << "  " << ResultCountLabel()
-            << ":";
-  const std::string label = ResultCountLabel();
-  const int pad = std::max(1, 18 - static_cast<int>(label.size()));
-  std::cout << std::string(static_cast<size_t>(pad), ' ') << cardinality
-            << " (true: " << true_cardinality << ")";
-  if (timing_only) {
-    std::cout << " [TIMING MODE]";
-  } else {
-    std::cout
-        << (cardinality == true_cardinality ? " [CORRECT]" : " [WRONG!]");
-  }
-  std::cout << std::endl;
-  std::cout << "  Receiver sent:     " << bytesToMB(s0->sent_bytes.load())
-            << " MB" << std::endl;
-  std::cout << "  Receiver recv:     " << bytesToMB(s0->recv_bytes.load())
-            << " MB" << std::endl;
-  std::cout << "  Sender sent:       " << bytesToMB(s1->sent_bytes.load())
-            << " MB" << std::endl;
-  std::cout << "  Sender recv:       " << bytesToMB(s1->recv_bytes.load())
-            << " MB" << std::endl;
-  if (setup_comm_bytes > 0) {
-    std::cout << "  Setup comm:        " << setup_comm_mb << " MB"
-              << std::endl;
-    if (fhe_key_comm_bytes > 0) {
-      std::cout << "  FHE key comm:      " << fhe_key_comm_mb << " MB"
-                << " (pk + relin)" << std::endl;
-    }
-    if (perm_setup_comm_bytes > 0) {
-      std::cout << "  Perm setup comm:   "
-                << bytesToMB(perm_setup_comm_bytes) << " MB" << std::endl;
-    }
-    if (peqt_setup_comm_bytes > 0) {
-      std::cout << "  PEQT setup comm:   "
-                << bytesToMB(peqt_setup_comm_bytes) << " MB" << std::endl;
-    }
-    if (peqt_comm_bytes > 0) {
-      std::cout << "  PEQT comm:         " << bytesToMB(peqt_comm_bytes)
-                << " MB" << std::endl;
-      if (ote_comm_bytes > 0) {
-        std::cout << "  OTE comm:          " << bytesToMB(ote_comm_bytes)
-                  << " MB" << std::endl;
-      }
-      if (perm_apply_comm_bytes > 0) {
-        std::cout << "  Perm online comm:  "
-                  << bytesToMB(perm_apply_comm_bytes) << " MB" << std::endl;
-      }
-      std::cout << "  FHE q/r comm:      " << fhe_query_response_comm_mb
-                << " MB" << std::endl;
-    }
-    std::cout << "  Online comm:       " << online_comm_mb << " MB"
-              << " (excl. pk/relin)" << std::endl;
-  }
-  std::cout << "  Total comm (S↔R):  " << total_comm_mb << " MB" << std::endl;
-}
 
 static void PrintSinglePartyStats(
     const std::string& name, const std::string& role,
@@ -851,30 +574,6 @@ static void PrintSinglePartyStats(
 }
 
 
-void TestPolyLinks() {
-  std::cout << "\n=== Testing Polynomial Links ===" << std::endl;
-  uint64_t prime = 65537;
-  size_t ks = 4;
-  size_t sigma2 = 10;
-
-  std::vector<uint128_t> items = {1234, 5678, 9012, 3456, 7890};
-  PolyLinkSubBin sub_bin = BuildPolyLinkSubBin(items, ks, sigma2, prime);
-
-  size_t pass = 0;
-  for (auto item : items) {
-    auto slices = SliceItem(item, ks, sigma2);
-    for (auto& s : slices) s %= prime;
-    bool matched = PolyLinkCheck(slices, sub_bin, prime);
-    if (matched) ++pass;
-  }
-  std::cout << "  " << pass << "/" << items.size() << " items match (expect all)" << std::endl;
-
-  uint128_t non_item = 99999;
-  auto non_slices = SliceItem(non_item, ks, sigma2);
-  for (auto& s : non_slices) s %= prime;
-  bool non_match = PolyLinkCheck(non_slices, sub_bin, prime);
-  std::cout << "  Non-member matches: " << (non_match ? "FAIL" : "PASS") << std::endl;
-}
 
 void ConfigureReferenceParams(ProtocolParams* params, size_t nx, size_t ny) {
   params->ks = 4;
@@ -1136,270 +835,6 @@ SweepMetrics RunLocalPsuOnce(size_t nx, size_t ny, size_t cap,
 }
 
 
-void RunBenchmark(const std::string& protocol_name, size_t nx, size_t ny,
-                  size_t intersection_size) {
-  std::cout << "\n>>> Benchmark: " << protocol_name << std::endl;
-  std::cout << "    |X|=" << nx << ", |Y|=" << ny
-            << ", |X∩Y|=" << intersection_size << std::endl;
-
-  auto x = CreateRangeItems(0, nx);
-  auto y = CreateRangeItems(nx - intersection_size, ny);
-
-  size_t true_card = TrueIntersectionSize(x, y);
-
-  auto lctxs = upsu::net::Context::SetupWorld(2);
-  lctxs[0]->SetRecvTimeout(600000);
-  lctxs[1]->SetRecvTimeout(600000);
-
-  ProtocolParams params;
-  ConfigureReferenceParams(&params, nx, ny);
-  params.reveal_match_items = true;
-  if (const char* depth_env = std::getenv("PSU_QUERY_DEPTH")) {
-    params.query_powers_max_depth = static_cast<size_t>(std::strtoull(depth_env, nullptr, 10));
-  }
-  const bool timing_only = EnvFlagEnabled("PSU_SYNTHETIC_ONLINE");
-  const size_t fhe_key_comm_bytes = EstimateFheKeyCommBytes(params);
-
-  std::shared_ptr<PreparedSender> prepared;
-  auto sender_offline_start = std::chrono::high_resolution_clock::now();
-  prepared = PrepareSender(x, params);
-  MaterializeSenderOnlineCache(prepared, params);
-  auto sender_offline_end = std::chrono::high_resolution_clock::now();
-  std::chrono::duration<double> sender_offline_elapsed =
-      sender_offline_end - sender_offline_start;
-  std::vector<std::string>().swap(x);
-
-  auto online_start = std::chrono::high_resolution_clock::now();
-
-  size_t result = 0;
-  std::vector<std::string> intersection;
-  OnlineStats sender_online_stats;
-  OnlineStats receiver_online_stats;
-  std::future<void> sender_fut =
-      std::async(std::launch::async, [&] {
-        SendPrepared(lctxs[0], prepared, params, &sender_online_stats);
-      });
-  std::future<std::vector<std::string>> recv_fut =
-      std::async(std::launch::async, [&]() {
-        return RecvItems(lctxs[1], y, params, &receiver_online_stats);
-      });
-  sender_fut.get();
-  intersection = recv_fut.get();
-  result = intersection.size();
-
-  auto online_end = std::chrono::high_resolution_clock::now();
-  std::chrono::duration<double> online_elapsed = online_end - online_start;
-  const double online_wall_s = online_elapsed.count();
-  const double setup_time_s =
-      std::max(sender_online_stats.setup_time_s, receiver_online_stats.setup_time_s);
-  const double perm_setup_time_s = std::max(
-      sender_online_stats.perm_setup_time_s,
-      receiver_online_stats.perm_setup_time_s);
-  const double peqt_setup_time_s = std::max(
-      sender_online_stats.peqt_setup_time_s,
-      receiver_online_stats.peqt_setup_time_s);
-  const double online_time_s = std::max(0.0, online_wall_s - setup_time_s);
-  const double perm_apply_time_s = std::max(
-      sender_online_stats.perm_apply_time_s,
-      receiver_online_stats.perm_apply_time_s);
-  const double peqt_time_s =
-      std::max(sender_online_stats.peqt_time_s, receiver_online_stats.peqt_time_s);
-  const size_t perm_setup_comm_bytes =
-      std::max(sender_online_stats.perm_setup_bytes,
-               receiver_online_stats.perm_setup_bytes);
-  const size_t perm_apply_comm_bytes =
-      std::max(sender_online_stats.perm_apply_bytes,
-               receiver_online_stats.perm_apply_bytes);
-  const size_t sender_peqt_local_comm_bytes =
-      sender_online_stats.peqt_local_sent_bytes +
-      sender_online_stats.peqt_local_recv_bytes;
-  const size_t receiver_peqt_local_comm_bytes =
-      receiver_online_stats.peqt_local_sent_bytes +
-      receiver_online_stats.peqt_local_recv_bytes;
-  const size_t sender_peqt_setup_local_comm_bytes =
-      sender_online_stats.peqt_setup_local_sent_bytes +
-      sender_online_stats.peqt_setup_local_recv_bytes;
-  const size_t receiver_peqt_setup_local_comm_bytes =
-      receiver_online_stats.peqt_setup_local_sent_bytes +
-      receiver_online_stats.peqt_setup_local_recv_bytes;
-  const size_t peqt_setup_local_comm_bytes =
-      std::max(sender_peqt_setup_local_comm_bytes,
-               receiver_peqt_setup_local_comm_bytes);
-  const size_t peqt_local_comm_bytes =
-      std::max(sender_peqt_local_comm_bytes, receiver_peqt_local_comm_bytes);
-  const size_t sender_peqt_comm_bytes =
-      sender_peqt_local_comm_bytes + sender_online_stats.peqt_link_sent_bytes +
-      sender_online_stats.peqt_link_recv_bytes;
-  const size_t receiver_peqt_comm_bytes =
-      receiver_peqt_local_comm_bytes + receiver_online_stats.peqt_link_sent_bytes +
-      receiver_online_stats.peqt_link_recv_bytes;
-  const size_t peqt_comm_bytes =
-      std::max(sender_peqt_comm_bytes, receiver_peqt_comm_bytes);
-
-  PrintStats(protocol_name, lctxs[0], lctxs[1], online_time_s, result,
-             true_card, sender_offline_elapsed.count(),
-             sender_offline_elapsed.count() + online_wall_s,
-             timing_only, fhe_key_comm_bytes, setup_time_s, online_wall_s,
-             perm_setup_time_s, peqt_setup_time_s, perm_apply_time_s,
-             peqt_time_s, perm_setup_comm_bytes, peqt_setup_local_comm_bytes,
-             perm_apply_comm_bytes, peqt_comm_bytes, peqt_local_comm_bytes);
-  if (ShouldPreviewOutputItems()) {
-    PrintOutputItems(intersection);
-  }
-}
-
-int RunOlmtBench() {
-  const size_t nx = GetEnvSize("PSU_MEDIUM_NX", size_t{1} << 16);
-  const size_t ny = GetEnvSize("PSU_MEDIUM_NY", 512);
-  const size_t cap = GetEnvSize("PSU_MEDIUM_CAP", 64);
-  const size_t recv_timeout_ms =
-      GetEnvSize("PSU_LINK_RECV_TIMEOUT_MS", size_t{600000});
-
-  std::cout << "\n=== OSLMS Benchmark ===" << std::endl;
-  std::cout << "|X|=" << nx << ", |Y|=" << ny
-            << ", |X∩Y|=" << cap << std::endl;
-
-  auto x = CreateRangeItems(0, nx);
-  auto y = CreateRangeItems(nx - cap, ny);
-
-  auto lctxs = upsu::net::Context::SetupWorld(2);
-  lctxs[0]->SetRecvTimeout(recv_timeout_ms);
-  lctxs[1]->SetRecvTimeout(recv_timeout_ms);
-
-  ProtocolParams params;
-  ConfigureReferenceParams(&params, nx, ny);
-  params.use_dh_oprf = false;
-  params.reveal_match_items = true;
-  if (const char* depth_env = std::getenv("PSU_QUERY_DEPTH")) {
-    params.query_powers_max_depth =
-        static_cast<size_t>(std::strtoull(depth_env, nullptr, 10));
-  }
-  const size_t fhe_key_comm_bytes = EstimateFheKeyCommBytes(params);
-
-  auto sender_offline_start = std::chrono::high_resolution_clock::now();
-  auto prepared = PrepareSender(x, params);
-  MaterializeSenderOnlineCache(prepared, params);
-  auto sender_offline_end = std::chrono::high_resolution_clock::now();
-  std::chrono::duration<double> sender_offline_elapsed =
-      sender_offline_end - sender_offline_start;
-
-  OnlineStats sender_online_stats;
-  OnlineStats receiver_online_stats;
-  std::vector<uint8_t> sender_choice_share;
-  OlmtReceiverOutput receiver_output;
-
-  auto online_start = std::chrono::high_resolution_clock::now();
-  std::future<void> sender_fut = std::async(std::launch::async, [&] {
-    sender_choice_share =
-        RunOlmtSender(lctxs[0], prepared, params, &sender_online_stats);
-  });
-  std::future<void> receiver_fut = std::async(std::launch::async, [&] {
-    receiver_output = RunOlmtReceiver(lctxs[1], y, params,
-                                      &receiver_online_stats);
-  });
-  sender_fut.get();
-  receiver_fut.get();
-  auto online_end = std::chrono::high_resolution_clock::now();
-  std::chrono::duration<double> online_elapsed = online_end - online_start;
-  const double online_wall_s = online_elapsed.count();
-
-  UPSU_ENFORCE(sender_choice_share.size() == receiver_output.choice_share.size(),
-               "OSLMS share size mismatch: got {} and {}",
-               sender_choice_share.size(), receiver_output.choice_share.size());
-  UPSU_ENFORCE(sender_choice_share.size() == receiver_output.aligned_values.size(),
-               "OSLMS value size mismatch: got {} shares and {} values",
-               sender_choice_share.size(), receiver_output.aligned_values.size());
-
-  std::vector<uint64_t> recovered_values;
-  recovered_values.reserve(receiver_output.aligned_values.size());
-  for (size_t i = 0; i < sender_choice_share.size(); ++i) {
-    const uint8_t match =
-        static_cast<uint8_t>((sender_choice_share[i] ^
-                              receiver_output.choice_share[i]) &
-                             1U);
-    const uint64_t value = receiver_output.aligned_values[i];
-    if (match == 0 && value != 0) {
-      recovered_values.push_back(value);
-    }
-  }
-  std::sort(recovered_values.begin(), recovered_values.end());
-  recovered_values.erase(
-      std::unique(recovered_values.begin(), recovered_values.end()),
-      recovered_values.end());
-
-  auto expected_values = EncodeItemsForFinalOte(y);
-  std::vector<uint64_t> expected_non_members;
-  expected_non_members.reserve(expected_values.size());
-  for (size_t i = 0; i < y.size(); ++i) {
-    if (static_cast<size_t>(std::strtoull(y[i].c_str(), nullptr, 10)) >= nx) {
-      expected_non_members.push_back(expected_values[i]);
-    }
-  }
-  std::sort(expected_non_members.begin(), expected_non_members.end());
-
-  const bool correct = (recovered_values == expected_non_members);
-  const double setup_time_s =
-      std::max(sender_online_stats.setup_time_s,
-               receiver_online_stats.setup_time_s);
-  const double perm_setup_time_s =
-      std::max(sender_online_stats.perm_setup_time_s,
-               receiver_online_stats.perm_setup_time_s);
-  const double peqt_setup_time_s =
-      std::max(sender_online_stats.peqt_setup_time_s,
-               receiver_online_stats.peqt_setup_time_s);
-  const double perm_apply_time_s =
-      std::max(sender_online_stats.perm_apply_time_s,
-               receiver_online_stats.perm_apply_time_s);
-  const double peqt_time_s =
-      std::max(sender_online_stats.peqt_time_s,
-               receiver_online_stats.peqt_time_s);
-  const double online_time_s = std::max(0.0, online_wall_s - setup_time_s);
-
-  const size_t perm_setup_comm_bytes =
-      std::max(sender_online_stats.perm_setup_bytes,
-               receiver_online_stats.perm_setup_bytes);
-  const size_t perm_apply_comm_bytes =
-      std::max(sender_online_stats.perm_apply_bytes,
-               receiver_online_stats.perm_apply_bytes);
-  const size_t sender_peqt_setup_local_comm_bytes =
-      sender_online_stats.peqt_setup_local_sent_bytes +
-      sender_online_stats.peqt_setup_local_recv_bytes;
-  const size_t receiver_peqt_setup_local_comm_bytes =
-      receiver_online_stats.peqt_setup_local_sent_bytes +
-      receiver_online_stats.peqt_setup_local_recv_bytes;
-  const size_t peqt_setup_local_comm_bytes =
-      std::max(sender_peqt_setup_local_comm_bytes,
-               receiver_peqt_setup_local_comm_bytes);
-  const size_t sender_peqt_local_comm_bytes =
-      sender_online_stats.peqt_local_sent_bytes +
-      sender_online_stats.peqt_local_recv_bytes;
-  const size_t receiver_peqt_local_comm_bytes =
-      receiver_online_stats.peqt_local_sent_bytes +
-      receiver_online_stats.peqt_local_recv_bytes;
-  const size_t peqt_local_comm_bytes =
-      std::max(sender_peqt_local_comm_bytes, receiver_peqt_local_comm_bytes);
-  const size_t sender_peqt_comm_bytes =
-      sender_peqt_local_comm_bytes + sender_online_stats.peqt_link_sent_bytes +
-      sender_online_stats.peqt_link_recv_bytes;
-  const size_t receiver_peqt_comm_bytes =
-      receiver_peqt_local_comm_bytes +
-      receiver_online_stats.peqt_link_sent_bytes +
-      receiver_online_stats.peqt_link_recv_bytes;
-  const size_t peqt_comm_bytes =
-      std::max(sender_peqt_comm_bytes, receiver_peqt_comm_bytes);
-
-  PrintStats("OSLMS (module benchmark)", lctxs[0], lctxs[1], online_time_s,
-             recovered_values.size(), expected_non_members.size(),
-             sender_offline_elapsed.count(),
-             sender_offline_elapsed.count() + online_wall_s, false,
-             fhe_key_comm_bytes, setup_time_s, online_wall_s,
-             perm_setup_time_s, peqt_setup_time_s, perm_apply_time_s,
-             peqt_time_s, perm_setup_comm_bytes, peqt_setup_local_comm_bytes,
-             perm_apply_comm_bytes, peqt_comm_bytes, peqt_local_comm_bytes, 0);
-  std::cout << "  OSLMS exact values: " << (correct ? "yes" : "no")
-            << std::endl;
-  return correct ? 0 : 1;
-}
 
 std::shared_ptr<upsu::net::Context> MakeBrpcLink(const std::string& parties,
                                                   size_t rank) {
@@ -1414,7 +849,7 @@ std::shared_ptr<upsu::net::Context> MakeBrpcLink(const std::string& parties,
 }
 
 int RunDistributedRole() {
-  const std::string mode = GetEnvString("PSU_MODE", "benchmark");
+  const std::string mode = GetEnvString("PSU_MODE", "list-profiles");
   const bool is_receiver = (mode == "receiver");
   const bool is_sender = (mode == "sender");
   if (!is_receiver && !is_sender) {
@@ -1501,7 +936,7 @@ int RunDistributedRole() {
     const size_t true_union = nx + ny - true_intersection;
 
     PrintSinglePartyStats(
-        std::string("PolyLinks-") +
+        std::string("Polynomial Links-") +
             ProtocolOutputName() +
             " (distributed)",
         "receiver", ctx, online_time_s, union_cardinality, true_union,
@@ -1558,7 +993,7 @@ int RunDistributedRole() {
       receiver_online_stats.peqt_link_recv_bytes;
 
   PrintSinglePartyStats(
-      std::string("PolyLinks-") +
+      std::string("Polynomial Links-") +
           ProtocolOutputName() +
           " (distributed)",
       "sender", ctx, online_time_s, std::nullopt, std::nullopt, -1.0,
@@ -1582,12 +1017,12 @@ int RunDistributedRole() {
   return 0;
 }
 
-int RunOlmtDistributedRole() {
+int RunS3mtDistributedRole() {
   const std::string mode = GetEnvString("PSU_MODE", "benchmark");
   const bool is_receiver =
-      (mode == "olmt-receiver" || mode == "olmt_receiver");
+      (mode == "s3mt-receiver" || mode == "s3mt_receiver");
   const bool is_sender =
-      (mode == "olmt-sender" || mode == "olmt_sender");
+      (mode == "s3mt-sender" || mode == "s3mt_sender");
   if (!is_receiver && !is_sender) {
     return -1;
   }
@@ -1615,16 +1050,16 @@ int RunOlmtDistributedRole() {
         static_cast<size_t>(std::strtoull(depth_env, nullptr, 10));
   }
 
-  std::cout << "\n=== Distributed OSLMS Mode ===" << std::endl;
+  std::cout << "\n=== Distributed S³MT Mode ===" << std::endl;
   std::cout << "Mode: " << (is_receiver ? "receiver" : "sender")
-            << ", protocol: OSLMS"
+            << ", protocol: S³MT"
             << ", parties: " << parties << std::endl;
   std::cout << "|X|=" << nx << ", |Y|=" << ny << ", |X∩Y|=" << cap
             << std::endl;
 
   auto ctx = MakeBrpcLink(parties, rank);
-  constexpr char kReadyTag[] = "UPSI:olmt_ready";
-  constexpr char kOlmtChoiceShareTag[] = "UPSI:olmt_choice_share";
+  constexpr char kReadyTag[] = "UPSI:s3mt_ready";
+  constexpr char kS3mtChoiceShareTag[] = "UPSI:s3mt_choice_share";
 
   if (is_receiver) {
     auto x = CreateRangeItems(0, nx);
@@ -1645,7 +1080,7 @@ int RunOlmtDistributedRole() {
     std::vector<uint8_t> sender_choice_share;
     auto online_start = std::chrono::high_resolution_clock::now();
     sender_choice_share =
-        RunOlmtSender(ctx, prepared, params, &sender_online_stats);
+        RunS3mtSender(ctx, prepared, params, &sender_online_stats);
     auto online_end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> online_elapsed = online_end - online_start;
     const double online_wall_s = online_elapsed.count();
@@ -1668,7 +1103,7 @@ int RunOlmtDistributedRole() {
     const size_t fhe_key_comm_bytes = EstimateFheKeyCommBytes(params);
 
     PrintSinglePartyStats(
-        "OSLMS (distributed)", "receiver", ctx, online_time_s, std::nullopt,
+        "S³MT (distributed)", "receiver", ctx, online_time_s, std::nullopt,
         std::nullopt, sender_offline_elapsed.count(),
         sender_offline_elapsed.count() + online_wall_s, false,
         fhe_key_comm_bytes, setup_time_s, online_wall_s,
@@ -1680,11 +1115,11 @@ int RunOlmtDistributedRole() {
       ctx->SendAsync(ctx->NextRank(),
                      upsu::Bytes(sender_choice_share.data(),
                                              sender_choice_share.size()),
-                     kOlmtChoiceShareTag);
+                     kS3mtChoiceShareTag);
     } else {
       static const char kEmpty = 0;
       ctx->SendAsync(ctx->NextRank(), upsu::Bytes(&kEmpty, 0),
-                     kOlmtChoiceShareTag);
+                     kS3mtChoiceShareTag);
     }
     return 0;
   }
@@ -1695,9 +1130,9 @@ int RunOlmtDistributedRole() {
 
   upsu::set_num_threads(online_thread_count);
   OnlineStats receiver_online_stats;
-  OlmtReceiverOutput olmt_output;
+  S3mtReceiverOutput s3mt_output;
   auto online_start = std::chrono::high_resolution_clock::now();
-  olmt_output = RunOlmtReceiver(ctx, y, params, &receiver_online_stats);
+  s3mt_output = RunS3mtReceiver(ctx, y, params, &receiver_online_stats);
   auto online_end = std::chrono::high_resolution_clock::now();
   std::chrono::duration<double> online_elapsed = online_end - online_start;
   const double online_wall_s = online_elapsed.count();
@@ -1720,27 +1155,27 @@ int RunOlmtDistributedRole() {
   const size_t fhe_key_comm_bytes = EstimateFheKeyCommBytes(params);
 
   PrintSinglePartyStats(
-      "OSLMS (distributed)", "sender", ctx, online_time_s, std::nullopt,
+      "S³MT (distributed)", "sender", ctx, online_time_s, std::nullopt,
       std::nullopt, -1.0, -1.0, false, fhe_key_comm_bytes, setup_time_s,
       online_wall_s, receiver_online_stats.peqt_time_s, perm_setup_time_s,
       peqt_setup_time_s, perm_apply_time_s, perm_setup_comm_bytes,
       peqt_setup_comm_bytes, perm_apply_comm_bytes, peqt_comm_bytes,
       peqt_local_comm_bytes, 0);
 
-  auto sender_share_buf = ctx->Recv(ctx->PrevRank(), kOlmtChoiceShareTag);
+  auto sender_share_buf = ctx->Recv(ctx->PrevRank(), kS3mtChoiceShareTag);
   UPSU_ENFORCE(static_cast<size_t>(sender_share_buf.size()) ==
-                   olmt_output.choice_share.size(),
-               "OSLMS sender-share size mismatch: got {}, expect {}",
-               sender_share_buf.size(), olmt_output.choice_share.size());
+                   s3mt_output.choice_share.size(),
+               "S³MT sender-share size mismatch: got {}, expect {}",
+               sender_share_buf.size(), s3mt_output.choice_share.size());
 
   std::vector<uint64_t> recovered_values;
-  recovered_values.reserve(olmt_output.aligned_values.size());
-  for (size_t i = 0; i < olmt_output.choice_share.size(); ++i) {
+  recovered_values.reserve(s3mt_output.aligned_values.size());
+  for (size_t i = 0; i < s3mt_output.choice_share.size(); ++i) {
     const uint8_t sender_share =
         static_cast<const uint8_t*>(sender_share_buf.data())[i];
     const uint8_t match =
-        static_cast<uint8_t>((sender_share ^ olmt_output.choice_share[i]) & 1U);
-    const uint64_t value = olmt_output.aligned_values[i];
+        static_cast<uint8_t>((sender_share ^ s3mt_output.choice_share[i]) & 1U);
+    const uint64_t value = s3mt_output.aligned_values[i];
     if (match == 0 && value != 0) {
       recovered_values.push_back(value);
     }
@@ -1761,108 +1196,14 @@ int RunOlmtDistributedRole() {
   std::sort(expected_non_members.begin(), expected_non_members.end());
 
   const bool correct = (recovered_values == expected_non_members);
-  std::cout << "  OSLMS non-members:  " << recovered_values.size()
+  std::cout << "  S³MT non-members:  " << recovered_values.size()
             << " (true: " << expected_non_members.size() << ")"
             << (correct ? " [CORRECT]" : " [WRONG!]") << std::endl;
-  std::cout << "  OSLMS exact values: " << (correct ? "yes" : "no")
+  std::cout << "  S³MT exact values: " << (correct ? "yes" : "no")
             << std::endl;
   return correct ? 0 : 1;
 }
 
-int RunPrepareCacheRole() {
-  std::cout << "\n=== Prepare Cache Mode Disabled ===" << std::endl;
-  std::cout << "Persistent cache is disabled. The sender state is prepared "
-               "in-memory during setup."
-            << std::endl;
-  return 1;
-}
-
-int RunOteProbe() {
-  const size_t n = GetEnvSize("PSU_MEDIUM_NY", 512);
-  std::cout << "\n=== OTE Backend Probe ===" << std::endl;
-  std::cout << "n=" << n << " (using current fixed Y size)" << std::endl;
-  std::cout << "payload_bits=" << ote::EqOtePayloadBits() << std::endl;
-
-  auto values = upsu::RandVec<uint64_t>(n, true);
-  for (auto& value : values) {
-    value = ote::NormalizeEqOteValue(value);
-  }
-  auto sender_share = SampleRandomBits(n);
-  auto receiver_share = SampleRandomBits(n);
-
-  struct ProbeRow {
-    std::string backend;
-    size_t bytes = 0;
-    double time_s = 0;
-    bool correct = false;
-  };
-  std::vector<ProbeRow> rows;
-
-  const char* original_backend_env = std::getenv("PSU_OTE_BACKEND");
-  std::string original_backend = original_backend_env ? original_backend_env : "";
-
-  for (const std::string backend : {"iknp", "softspoken", "silent"}) {
-    setenv("PSU_OTE_BACKEND", backend.c_str(), 1);
-    auto lctxs = upsu::net::Context::SetupWorld(2);
-    lctxs[0]->SetRecvTimeout(600000);
-    lctxs[1]->SetRecvTimeout(600000);
-
-    ote::SenderResult sender_result;
-    ote::ReceiverResult receiver_result;
-    std::future<void> sender_fut = std::async(std::launch::async, [&]() {
-      sender_result = ote::RunEqValueSenderRole(lctxs[0], values, sender_share);
-    });
-    std::future<void> receiver_fut = std::async(std::launch::async, [&]() {
-      receiver_result = ote::RunEqValueReceiverRole(lctxs[1], receiver_share);
-    });
-    sender_fut.get();
-    receiver_fut.get();
-
-    bool correct = (receiver_result.values.size() == values.size());
-    if (correct) {
-      for (size_t i = 0; i < values.size(); ++i) {
-        const uint64_t expect =
-            ((sender_share[i] & 1U) == (receiver_share[i] & 1U))
-                ? ote::NormalizeEqOteValue(values[i])
-                : 0;
-        if (receiver_result.values[i] != expect) {
-          correct = false;
-          break;
-        }
-      }
-    }
-
-    rows.push_back(ProbeRow{
-        .backend = backend,
-        .bytes = std::max(sender_result.bytes, receiver_result.bytes),
-        .time_s = std::max(sender_result.time_s, receiver_result.time_s),
-        .correct = correct,
-    });
-  }
-
-  if (original_backend.empty()) {
-    unsetenv("PSU_OTE_BACKEND");
-  } else {
-    setenv("PSU_OTE_BACKEND", original_backend.c_str(), 1);
-  }
-
-  std::sort(rows.begin(), rows.end(),
-            [](const ProbeRow& a, const ProbeRow& b) { return a.bytes < b.bytes; });
-
-  for (const auto& row : rows) {
-    std::cout << "  " << row.backend << ": bytes=" << row.bytes
-              << ", time=" << row.time_s << " s"
-              << ", correct=" << (row.correct ? "yes" : "no") << std::endl;
-  }
-
-  UPSU_ENFORCE(!rows.empty(), "ote probe produced no results");
-  UPSU_ENFORCE(rows.front().correct, "best backend failed correctness check");
-  std::cout << "Best backend for n=" << n << ": " << rows.front().backend
-            << std::endl;
-  std::cout << "Set this for fixed use: PSU_OTE_BACKEND="
-            << rows.front().backend << std::endl;
-  return 0;
-}
 
 std::string JoinInts(const std::vector<int>& values) {
   std::ostringstream oss;
@@ -2115,7 +1456,7 @@ int RunPolyInterpolationBench() {
        << "avg_speedup,ks,sigma2_bits,plain_modulus,trials,warmup,threads,"
        << "jobs\n";
 
-  std::cout << "\n=== PolyLinks Interpolation Benchmark ===" << std::endl;
+  std::cout << "\n=== Polynomial Links Interpolation Benchmark ===" << std::endl;
   std::cout << "points=" << min_points << ".." << max_points
             << ", step=" << step << ", trials=" << trials
             << ", warmup=" << warmup << ", threads=" << upsu::get_num_threads()
@@ -2387,12 +1728,7 @@ int main() {
   size_t configured_threads = GetEnvSize(
       "PSU_THREADS",
       static_cast<size_t>(upsu::intraop_default_num_threads()));
-  if (mode == "prepare-cache" || mode == "prepare_cache" ||
-      mode == "prepare-receiver-cache" ||
-      mode == "prepare_receiver_cache") {
-    configured_threads = GetEnvSize("PSU_OFFLINE_THREADS",
-                                    configured_threads);
-  } else if (mode == "sender" || mode == "receiver") {
+  if (mode == "sender" || mode == "receiver") {
     const size_t online_threads =
         GetEnvSize("PSU_ONLINE_THREADS", configured_threads);
     const size_t offline_threads =
@@ -2409,7 +1745,7 @@ int main() {
   std::cout << "==========================================================="
             << std::endl;
   std::cout << "PSU Implementation" << std::endl;
-  std::cout << "  Pipeline: PolyLinks with packed PEQT and OTE union recovery"
+  std::cout << "  Pipeline: Polynomial Links, packed zero test, and EQOTE"
             << std::endl;
   std::cout << "Threads: " << upsu::get_num_threads() << std::endl;
   const std::string active_profile = GetEnvString("PSU_PROFILE");
@@ -2423,19 +1759,9 @@ int main() {
     return RunDistributedRole();
   }
 
-  if (mode == "olmt-receiver" || mode == "olmt_receiver" ||
-      mode == "olmt-sender" || mode == "olmt_sender") {
-    return RunOlmtDistributedRole();
-  }
-
-  if (mode == "prepare-cache" || mode == "prepare_cache" ||
-      mode == "prepare-receiver-cache" ||
-      mode == "prepare_receiver_cache") {
-    return RunPrepareCacheRole();
-  }
-
-  if (mode == "ote-probe" || mode == "ote_probe") {
-    return RunOteProbe();
+  if (mode == "s3mt-receiver" || mode == "s3mt_receiver" ||
+      mode == "s3mt-sender" || mode == "s3mt_sender") {
+    return RunS3mtDistributedRole();
   }
 
   if (mode == "packed-zero-bench" || mode == "packed_zero_bench") {
@@ -2452,10 +1778,6 @@ int main() {
     return RunPolyInterpolationBench();
   }
 
-  if (mode == "olmt-bench" || mode == "olmt_bench") {
-    return RunOlmtBench();
-  }
-
   if (mode == "fhe-sweep" || mode == "fhe_sweep") {
     return RunFheSweep();
   }
@@ -2464,32 +1786,6 @@ int main() {
     return RunAlphaSweep();
   }
 
-  TestPolyLinks();
-  {
-    ProtocolParams self_test_params;
-    self_test_params.Finalize();
-    SelfTestWindowedPowers(self_test_params);
-  }
-
-  std::cout << "\n=== Correctness tests (small scale) ===" << std::endl;
-
-  if (ShouldRunBenchmark(
-          "PolyLinks-PSU (small: nx=1000, ny=100, cap=20)")) {
-    RunBenchmark("PolyLinks-PSU (small: nx=1000, ny=100, cap=20)",
-                 1000, 100, 20);
-  }
-
-  std::cout << "\n=== Medium-scale benchmarks ===" << std::endl;
-  std::cout << "(Reference medium setting: nx=2^20, ny=2048)" << std::endl;
-
-  size_t nx_med = GetEnvSize("PSU_MEDIUM_NX", size_t{1} << 16);
-  size_t ny_med = GetEnvSize("PSU_MEDIUM_NY", 512);
-  size_t cap_med = GetEnvSize("PSU_MEDIUM_CAP", 64);
-
-  if (ShouldRunBenchmark("PolyLinks-PSU (medium)")) {
-    RunBenchmark("PolyLinks-PSU (medium)", nx_med, ny_med, cap_med);
-  }
-
-  std::cout << "\n=== Done ===" << std::endl;
-  return 0;
+  std::cerr << "unsupported PSU_MODE: " << mode << std::endl;
+  return 2;
 }

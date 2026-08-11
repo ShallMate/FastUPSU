@@ -90,11 +90,11 @@ scenario_enabled() {
 usage() {
   cat <<'EOF'
 Usage:
-  run_olmt_tc_matrix.sh
+  run_s3mt_tc_matrix.sh
 
 This script:
 1. shapes loopback traffic with tc,
-2. runs the OSLMS module benchmark across configured profiles,
+2. runs the S³MT module benchmark across configured profiles,
 3. stores per-run logs under net_eval/<timestamp>/,
 4. writes both a detailed TSV and a compact CSV.
 
@@ -224,7 +224,7 @@ for idx in "${!SCENARIO_NAMES[@]}"; do
         PSU_LINK_CHUNK_PARALLEL_SEND_SIZE='${PSU_LINK_CHUNK_PARALLEL_SEND_SIZE}' \
         PSU_SETTINGS_FILE='${SETTINGS_FILE}' \
         PSU_PROFILE='${profile}' \
-        '${SCRIPT_DIR}/run_olmt_two_party.sh'
+        '${SCRIPT_DIR}/run_s3mt_two_party.sh'
     " |& tee "${console_log}"
 
     receiver_log="${log_dir}/receiver.log"
@@ -266,6 +266,6 @@ for idx in "${!SCENARIO_NAMES[@]}"; do
   done
 done
 
-echo "all OSLMS runs completed"
+echo "all S³MT runs completed"
 echo "summary: ${SUMMARY_FILE}"
 echo "core metrics: ${CORE_CSV_FILE}"

@@ -42,7 +42,7 @@ if [[ ! -x "${BIN}" ]]; then
   exit 1
 fi
 
-echo "== PolyLinks interpolation benchmark =="
+echo "== Polynomial Links interpolation benchmark =="
 echo "threads=${THREADS}, jobs=${JOBS}, points=${MIN_POINTS}..${MAX_POINTS}, trials=${TRIALS}"
 
 (

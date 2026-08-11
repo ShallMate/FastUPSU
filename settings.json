@@ -15,8 +15,6 @@
     "x24_y13",
     "x24_y14"
   ],
-  "prepared_cache_file": "cache/{profile}{candidate_suffix}/prepared_sender.bin",
-  "intermediate_cache_file": "cache/{profile}{candidate_suffix}/intermediate_sender.bin",
   "offline_threads": 8,
   "online_threads": 1,
   "bench_filter": "",

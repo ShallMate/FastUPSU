@@ -1,18 +1,15 @@
-# UPSU
+# Online-Efficient Unbalanced Private Set Union with Low Communication
 
-Standalone CMake implementation of the two-party UPSU protocol. The source,
-build system, runtime settings, and experiment scripts in this directory do
-not depend on an external monorepo.
+Standalone CMake implementation of the paper experiments.
 
-## Platform
+## Requirements
 
-- Ubuntu 20.04 or newer on x86-64
+- Ubuntu 20.04+ on x86-64
 - GCC 10+ or Clang 12+
-- CPU support for AES-NI, PCLMUL, BMI2, SSE4.1, AVX, and AVX2
-- Git network access during the first configure (pinned third-party sources are
-  downloaded by CMake)
+- AES-NI, PCLMUL, BMI2, SSE4.1, AVX and AVX2
+- Git network access for the first build
 
-Install system packages:
+Install system dependencies:
 
 ```bash
 ./scripts/install_deps_ubuntu.sh
@@ -24,36 +21,48 @@ Install system packages:
 ./build.sh
 ```
 
-The executable is written to `build/psu`. To use a different build directory:
+The binary is generated at `build/psu`.
 
 ```bash
 BUILD_DIR=/tmp/upsu-build BUILD_JOBS=8 ./build.sh
 ```
 
-## Verify with a real two-party run
+## Run
 
-The smoke command starts both parties over TCP, runs the complete protocol on
-small synthetic sets, and verifies the recovered union:
+Small two-party smoke test:
 
 ```bash
 ./run_smoke.sh
 ```
 
-Logs are written to `logs/smoke/receiver.log` and
-`logs/smoke/sender.log`. Ports can be overridden with `PSU_PARTIES`,
-`PSU_PERM_ADDRESS`, `PSU_OTE_ADDRESS`, and `PSU_PEQT_ADDRESS`.
-
-## Run a configured profile
+Run a configured profile:
 
 ```bash
 PSU_PROFILE=x20_y11 BUILD_FIRST=0 ./run_two_party.sh
 ```
 
-List all profiles:
+List profiles:
 
 ```bash
 PSU_MODE=list-profiles PSU_SETTINGS_FILE="$PWD/settings.json" ./build/psu
 ```
 
-All other `run_*.sh`, `prepare_*.sh`, and `sweep_*.sh` scripts use the same
-CMake binary. Run a script with `--help` for its environment overrides.
+Runtime parameters are in `settings.json`. Environment variables can override
+the corresponding settings.
+
+Logs are written to `logs/smoke/` for the smoke test and `logs/` for regular
+two-party runs.
+
+## Experiments
+
+```bash
+./run_psu_time_matrix.sh
+./run_tc_matrix.sh
+./run_s3mt_time_matrix.sh
+./run_s3mt_tc_matrix.sh
+./run_packed_zero_test_matrix.sh
+./run_online_permutation_matrix.sh
+./run_poly_interp_bench.sh
+./run_alpha_sweep.sh
+./sweep_fhe_params.sh
+```
