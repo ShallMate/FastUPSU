@@ -1,7 +1,5 @@
 # Online-Efficient Unbalanced Private Set Union with Low Communication
 
-Standalone CMake implementation of the paper experiments.
-
 ## Requirements
 
 - Ubuntu 20.04+ on x86-64

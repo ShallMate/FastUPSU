@@ -141,7 +141,6 @@ target_link_libraries(secure_join_impl PUBLIC libOTe)
 
 add_executable(psu
   main.cc unbalanced_psu.cc polynomial_links.cc dh_oprf.cc response_sanitizer.cc
-  peqt_coproto_globals.cc
   GMW/Circuit.cpp GMW/Gmw.cpp GMW/SilentTripleGen.cpp
   src/common.cc src/parallel.cc src/net_context.cc src/powers_dag.cc)
 target_include_directories(psu PRIVATE

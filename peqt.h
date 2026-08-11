@@ -5,13 +5,17 @@
 #include "upsu/parallel.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <future>
+#include <iostream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -22,16 +26,95 @@
 #include "coproto/coproto.h"
 #include "GMW/Circuit.h"
 #include "GMW/Gmw.h"
-#include "coproto_asio_globals.h"
-#include "debug_logging.h"
-#include "local_comm_stats.h"
+
+namespace coproto::detail {
+
+inline optional<GlobalIOContext> global_asio_io_context;
+inline std::mutex global_asio_io_context_mutex;
+
+}
+
+namespace coproto {
+
+inline std::mutex ggMtx;
+inline std::vector<std::string> ggLog;
+
+}
 
 namespace psu::peqt {
 
 using Block = uint128_t;
 
+inline bool PeqtDebugEnabled() {
+  static const bool enabled = [] {
+    const char* env = std::getenv("PSU_DEBUG");
+    if (env == nullptr) {
+      return false;
+    }
+    const std::string value(env);
+    return value == "1" || value == "true" || value == "TRUE" ||
+           value == "on" || value == "ON";
+  }();
+  return enabled;
+}
+
 inline void PeqtDebugLog(const std::string& message) {
-  debug::LogKv("peqt", message);
+  if (!PeqtDebugEnabled()) {
+    return;
+  }
+  static const auto start = std::chrono::steady_clock::now();
+  static std::mutex mu;
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - start)
+                           .count();
+  std::lock_guard<std::mutex> lock(mu);
+  std::cerr << "[psu][debug][t+" << elapsed << "ms] peqt " << message
+            << std::endl;
+}
+
+struct LocalCommStats {
+  std::array<uint64_t, 2> sent = {0, 0};
+  std::array<uint64_t, 2> recv = {0, 0};
+};
+
+inline std::array<std::atomic<uint64_t>, 2>& LocalSentCounters() {
+  static std::array<std::atomic<uint64_t>, 2> counters = {
+      std::atomic<uint64_t>(0), std::atomic<uint64_t>(0)};
+  return counters;
+}
+
+inline std::array<std::atomic<uint64_t>, 2>& LocalRecvCounters() {
+  static std::array<std::atomic<uint64_t>, 2> counters = {
+      std::atomic<uint64_t>(0), std::atomic<uint64_t>(0)};
+  return counters;
+}
+
+inline void ResetLocalCommStats() {
+  for (auto& counter : LocalSentCounters()) {
+    counter.store(0, std::memory_order_relaxed);
+  }
+  for (auto& counter : LocalRecvCounters()) {
+    counter.store(0, std::memory_order_relaxed);
+  }
+}
+
+inline void RecordLocalComm(int rank, uint64_t sent, uint64_t recv) {
+  if (rank < 0 || rank >= 2) {
+    return;
+  }
+  LocalSentCounters()[static_cast<size_t>(rank)].fetch_add(
+      sent, std::memory_order_relaxed);
+  LocalRecvCounters()[static_cast<size_t>(rank)].fetch_add(
+      recv, std::memory_order_relaxed);
+}
+
+inline LocalCommStats GetLocalCommStats() {
+  LocalCommStats stats;
+  for (size_t i = 0; i < 2; ++i) {
+    stats.sent[i] = LocalSentCounters()[i].load(std::memory_order_relaxed);
+    stats.recv[i] = LocalRecvCounters()[i].load(std::memory_order_relaxed);
+  }
+  return stats;
 }
 
 inline void SendAsyncBytes(const std::shared_ptr<upsu::net::Context>& ctx,
@@ -334,7 +417,7 @@ inline void RunPreparedBatchCircuitGmw(
   FlushLocalSocket(*state->sock);
   const auto bytes_end = TakeSocketBytesSnapshot(*state->sock);
   const auto bytes_diff = DiffSocketBytes(bytes_begin, bytes_end);
-  local_comm_stats::Record(rank, bytes_diff.sent, bytes_diff.recv);
+  RecordLocalComm(rank, bytes_diff.sent, bytes_diff.recv);
 
   volePSI::Matrix<volePSI::u8> out;
   out.resize(state->item_count, 1);
@@ -377,7 +460,7 @@ inline void RunPreparedMultiInputBatchCircuitGmw(
   FlushLocalSocket(*state->sock);
   const auto bytes_end = TakeSocketBytesSnapshot(*state->sock);
   const auto bytes_diff = DiffSocketBytes(bytes_begin, bytes_end);
-  local_comm_stats::Record(rank, bytes_diff.sent, bytes_diff.recv);
+  RecordLocalComm(rank, bytes_diff.sent, bytes_diff.recv);
 
   volePSI::Matrix<volePSI::u8> out;
   out.resize(state->item_count, 1);
