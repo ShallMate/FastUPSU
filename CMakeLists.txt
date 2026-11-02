@@ -162,8 +162,8 @@ set(UPSU_LIBOTE_TARGET libOTe)
 endif()
 
 add_executable(psu
-  main.cc unbalanced_psu.cc polynomial_links.cc response_sanitizer.cc
-  GMW/Circuit.cpp GMW/Gmw.cpp GMW/SilentTripleGen.cpp
+  src/main.cc src/unbalanced_psu.cc src/polynomial_links.cc src/response_sanitizer.cc
+  src/GMW/Circuit.cpp src/GMW/Gmw.cpp src/GMW/SilentTripleGen.cpp
   src/common.cc src/parallel.cc src/net_context.cc src/powers_dag.cc)
 target_sources(psu PRIVATE src/serialization.cc)
 target_sources(psu PRIVATE src/input_encoding.cc)
@@ -195,7 +195,7 @@ if(UPSU_CPU_FEATURES_LIBRARY)
 endif()
 
 add_executable(salted_hash_regression EXCLUDE_FROM_ALL
-  salted_hash_regression.cc src/input_encoding.cc src/common.cc src/parallel.cc)
+  tests/salted_hash_regression.cc src/input_encoding.cc src/common.cc src/parallel.cc)
 target_include_directories(salted_hash_regression PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_compile_options(salted_hash_regression PRIVATE -O3)
 target_link_libraries(salted_hash_regression PRIVATE BLAKE3::blake3 fmt::fmt OpenSSL::Crypto Threads::Threads)

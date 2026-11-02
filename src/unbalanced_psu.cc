@@ -1,5 +1,5 @@
 
-#include "unbalanced_psu.h"
+#include "upsu/unbalanced_psu.h"
 #include "upsu/benchmark_diagnostics.h"
 #include "upsu/paper_encoding.h"
 #include "upsu/paper_placement.h"
@@ -45,9 +45,9 @@
 #include "coproto/coproto.h"
 #include "cryptoTools/Common/Defines.h"
 #include "cryptoTools/Crypto/PRNG.h"
-#include "polynomial_links.h"
-#include "peqt.h"
-#include "response_sanitizer.h"
+#include "upsu/polynomial_links.h"
+#include "upsu/peqt.h"
+#include "upsu/response_sanitizer.h"
 
 namespace osuCrypto {
 

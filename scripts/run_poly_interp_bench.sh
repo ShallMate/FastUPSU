@@ -3,13 +3,13 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="${SCRIPT_DIR}"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 source "${PROJECT_ROOT}/scripts/common.sh"
 
 # Edit this block before running the script.
 BIN="${BUILD_DIR}/psu"
 BUILD_FIRST=1
-OUT_ROOT="${SCRIPT_DIR}/interp_eval"
+OUT_ROOT="${PROJECT_ROOT}/results/interp_eval"
 RUN_ID="interp_$(date +%Y%m%d_%H%M%S)"
 THREADS=8
 JOBS=8

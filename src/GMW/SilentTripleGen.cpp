@@ -1,4 +1,4 @@
-#include "SilentTripleGen.h"
+#include "GMW/SilentTripleGen.h"
 #include "cryptoTools/Network/IOService.h"
 #include "cryptoTools/Network/Session.h"
 

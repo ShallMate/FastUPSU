@@ -22,9 +22,9 @@
 #include <vector>
 
 #include "upsu/powers_dag.h"
-#include "eqote.h"
-#include "polynomial_links.h"
-#include "unbalanced_psu.h"
+#include "upsu/eqote.h"
+#include "upsu/polynomial_links.h"
+#include "upsu/unbalanced_psu.h"
 #include "seal/modulus.h"
 
 using namespace psu;

@@ -3,13 +3,13 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="${SCRIPT_DIR}"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 source "${PROJECT_ROOT}/scripts/common.sh"
 BIN="${BIN:-${BUILD_DIR}/psu}"
-SETTINGS_FILE="${PSU_SETTINGS_FILE:-${SCRIPT_DIR}/settings.json}"
+SETTINGS_FILE="${PSU_SETTINGS_FILE:-${PROJECT_ROOT}/settings.json}"
 BUILD_FIRST="${BUILD_FIRST:-0}"
 PROFILE_CSV="${PSU_PROFILES:-}"
-OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/results/fhe_sweep}"
+OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/results/fhe_sweep}"
 
 usage() {
   cat <<'EOF'

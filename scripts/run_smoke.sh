@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 export BUILD_FIRST="${BUILD_FIRST:-1}"
 export PSU_PROFILE="${PSU_PROFILE:-smoke}"
@@ -19,4 +19,4 @@ export PSU_OTE_ADDRESS="${PSU_OTE_ADDRESS:-127.0.0.1:19370}"
 export PSU_PEQT_ADDRESS="${PSU_PEQT_ADDRESS:-127.0.0.1:19380}"
 export LOG_DIR="${LOG_DIR:-${ROOT}/logs/smoke}"
 
-exec "${ROOT}/run_two_party.sh"
+exec "${ROOT}/scripts/run_two_party.sh"

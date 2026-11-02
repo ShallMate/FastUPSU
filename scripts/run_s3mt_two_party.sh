@@ -3,14 +3,14 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="${SCRIPT_DIR}"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 source "${PROJECT_ROOT}/scripts/common.sh"
 BIN="${BIN:-${BUILD_DIR}/psu}"
-SETTINGS_FILE="${PSU_SETTINGS_FILE:-${SCRIPT_DIR}/settings.json}"
+SETTINGS_FILE="${PSU_SETTINGS_FILE:-${PROJECT_ROOT}/settings.json}"
 PROFILE="${PSU_PROFILE:-}"
 PARTIES="${PSU_PARTIES:-127.0.0.1:9300,127.0.0.1:9301}"
 BUILD_FIRST="${BUILD_FIRST:-0}"
-LOG_DIR="${LOG_DIR:-${SCRIPT_DIR}/logs}"
+LOG_DIR="${LOG_DIR:-${PROJECT_ROOT}/logs}"
 RECEIVER_LOG="${LOG_DIR}/receiver.log"
 SENDER_LOG="${LOG_DIR}/sender.log"
 

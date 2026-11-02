@@ -3,14 +3,14 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="${SCRIPT_DIR}"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 source "${PROJECT_ROOT}/scripts/common.sh"
 
 # Edit this block before running the script.
 BIN="${BUILD_DIR}/psu"
-SETTINGS_FILE="${SCRIPT_DIR}/settings.json"
+SETTINGS_FILE="${PROJECT_ROOT}/settings.json"
 BUILD_FIRST=0
-OUT_ROOT="${SCRIPT_DIR}/alpha_eval"
+OUT_ROOT="${PROJECT_ROOT}/results/alpha_eval"
 RUN_ID="alpha_$(date +%Y%m%d_%H%M%S)"
 TRIALS=100
 # Upper bound for the polynomial degree. The actual degree may be smaller.

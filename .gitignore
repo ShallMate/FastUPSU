@@ -9,3 +9,4 @@
 __pycache__/
 *.pyc
 /benchmarks/.experiment.lock
+/local_archive/

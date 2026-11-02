@@ -1,6 +1,6 @@
 
-#include "polynomial_links.h"
-#include "small_field_polynomials.h"
+#include "upsu/polynomial_links.h"
+#include "upsu/small_field_polynomials.h"
 
 #include <cassert>
 #include <cstdint>

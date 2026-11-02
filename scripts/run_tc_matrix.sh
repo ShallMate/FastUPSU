@@ -3,12 +3,12 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="${SCRIPT_DIR}"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 source "${PROJECT_ROOT}/scripts/common.sh"
 BIN="${BIN:-${BUILD_DIR}/psu}"
-SETTINGS_FILE="${PSU_SETTINGS_FILE:-${SCRIPT_DIR}/settings.json}"
+SETTINGS_FILE="${PSU_SETTINGS_FILE:-${PROJECT_ROOT}/settings.json}"
 BUILD_FIRST="${BUILD_FIRST:-1}"
-OUT_ROOT="${OUT_ROOT:-${SCRIPT_DIR}/net_eval}"
+OUT_ROOT="${OUT_ROOT:-${PROJECT_ROOT}/results/net_eval}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 RUN_ROOT="${OUT_ROOT}/${RUN_ID}"
 SUMMARY_FILE="${RUN_ROOT}/summary.tsv"

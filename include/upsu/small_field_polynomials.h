@@ -6,7 +6,7 @@
 #include <vector>
 #include <NTL/lzz_p.h>
 #include <NTL/lzz_pX.h>
-#include "polynomial_links.h"
+#include "upsu/polynomial_links.h"
 
 namespace psu::small_field {
 
