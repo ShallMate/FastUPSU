@@ -23,9 +23,9 @@ struct ProtocolParams {
   std::vector<int> coeff_modulus_bits = {56, 56, 56, 50};
   uint64_t plain_modulus = 65537;
 
-  size_t sigma1_bits = 40;
+  size_t sigma1_bits = 128;
   bool use_permutation_hashing = false;
-  bool use_dh_oprf = true;
+  bool use_salted_hash = true;
 
   size_t ks = 4;
   size_t sigma2_bits = 10;
@@ -36,6 +36,7 @@ struct ProtocolParams {
   size_t simple_hash_bins = 512;
   size_t alpha = 1;
   size_t max_items_per_bin = 2048;
+  size_t public_sub_bin_size = 0;
 
   size_t query_powers_max_depth = 2;
   size_t ps_low_degree = 0;
@@ -60,12 +61,10 @@ struct ProtocolParams {
   }
 
   size_t EffectiveItemBitCount() const {
-    const size_t reduction_bits = PermutationIndexBits();
-    UPSU_ENFORCE(sigma1_bits > reduction_bits,
-                 "effective item bit count must stay positive: sigma1_bits={} "
-                 "reduction_bits={}",
-                 sigma1_bits, reduction_bits);
-    return sigma1_bits - reduction_bits;
+    size_t slice_bits = 0;
+    for (uint64_t v = plain_modulus; v > 1; v >>= 1) ++slice_bits;
+    UPSU_ENFORCE(ks * slice_bits <= 128, "payload slices exceed full encoding width");
+    return ks * slice_bits;
   }
 
   void Finalize() {
@@ -85,6 +84,10 @@ struct ProtocolResult {
 
 struct OnlineStats {
   double setup_time_s = 0;
+  double encoding_time_s = 0;
+  size_t encoding_comm_bytes = 0;
+  size_t fhe_key_comm_bytes = 0;
+  size_t fhe_key_saved_bytes = 0;
   double perm_setup_time_s = 0;
   double peqt_setup_time_s = 0;
   double perm_apply_time_s = 0;
@@ -134,12 +137,14 @@ struct AlphaSampleMetrics {
 
 struct BinOteSenderInputs {
   std::vector<uint8_t> sender_share;
-  std::vector<uint64_t> sender_values;
+  std::vector<uint128_t> sender_values;
+  std::vector<uint8_t> sender_valid;
 };
 
 struct S3mtReceiverOutput {
   std::vector<uint8_t> choice_share;
-  std::vector<uint64_t> aligned_values;
+  std::vector<uint128_t> aligned_values;
+  std::vector<uint8_t> aligned_valid;
 };
 
 
@@ -194,7 +199,7 @@ S3mtReceiverOutput RunS3mtReceiver(
     const ProtocolParams& params,
     OnlineStats* online_stats = nullptr);
 
-std::vector<uint64_t> EncodeItemsForFinalOte(
+std::vector<uint128_t> EncodeItemsForFinalOte(
     const std::vector<std::string>& items);
 
 std::vector<std::string> RecvItems(
@@ -209,7 +214,7 @@ uint64_t ChoosePlainModulus(size_t poly_modulus_degree, size_t sigma2_bits);
 
 size_t EstimateFheKeyCommBytes(const ProtocolParams& params);
 
-AlphaSampleMetrics SampleAlphaAfterOprf(
+AlphaSampleMetrics SampleAlphaAfterEncoding(
     const std::vector<std::string>& sender_items, size_t receiver_set_size,
     const ProtocolParams& params);
 

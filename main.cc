@@ -1,6 +1,8 @@
 #include "upsu/common.h"
 #include "upsu/net/context.h"
 #include "upsu/parallel.h"
+#include "upsu/item.h"
+#include "upsu/serialization.h"
 
 #include <chrono>
 #include <algorithm>
@@ -31,8 +33,11 @@ using namespace psu;
 std::vector<std::string> CreateRangeItems(size_t begin, size_t size) {
   std::vector<std::string> items;
   items.reserve(size);
+  const char* seed = std::getenv("PSU_RANDOM_INPUT_SEED");
   for (size_t i = 0; i < size; ++i) {
-    items.push_back(std::to_string(begin + i));
+    const auto index = std::to_string(begin + i);
+    items.push_back(seed ? upsu::ItemHex(upsu::Hash128(
+        upsu::Bytes(std::string(seed) + ":" + index))) : index);
   }
   return items;
 }
@@ -216,7 +221,7 @@ void ApplySettingsBlock(const std::string& json, const std::string& key_prefix,
                "PSU_MAX_ITEMS_PER_BIN");
   apply_flag(prefixed("permutation_hashing"),
              "PSU_PERMUTATION_HASHING");
-  apply_flag(prefixed("dh_oprf"), "PSU_USE_DH_OPRF");
+  apply_flag(prefixed("salted_hash"), "PSU_USE_SALTED_HASH");
   apply_flag(prefixed("circuit_peqt"), "PSU_CIRCUIT_PEQT");
   apply_flag(prefixed("drop_first_poly"), "PSU_DROP_FIRST_POLY");
   apply_scalar(prefixed("query_depth"), "PSU_QUERY_DEPTH");
@@ -412,13 +417,15 @@ static void PrintSinglePartyStats(
     double perm_apply_time_s = -1.0, size_t perm_setup_comm_bytes = 0,
     size_t peqt_setup_comm_bytes = 0, size_t perm_apply_comm_bytes = 0,
     size_t peqt_comm_bytes = 0, size_t peqt_local_comm_bytes = 0,
-    size_t ote_comm_bytes = 0) {
+    size_t ote_comm_bytes = 0, size_t excluded_link_bytes = 0) {
   auto bytesToMB = [](size_t bytes) -> double {
     return static_cast<double>(bytes) / (1024.0 * 1024.0);
   };
   auto stats = ctx->GetStats();
+  UPSU_ENFORCE(stats->sent_bytes.load()+stats->recv_bytes.load()>=excluded_link_bytes,
+               "module communication exclusion exceeds the recorded traffic");
   const size_t total_link_comm_bytes =
-      stats->sent_bytes.load() + stats->recv_bytes.load();
+      stats->sent_bytes.load() + stats->recv_bytes.load() - excluded_link_bytes;
   const size_t setup_comm_bytes =
       fhe_key_comm_bytes + perm_setup_comm_bytes + peqt_setup_comm_bytes;
   const size_t total_comm_bytes =
@@ -571,6 +578,9 @@ static void PrintSinglePartyStats(
   }
   std::cout << "  Total comm (S↔R):  " << bytesToMB(total_comm_bytes) << " MB"
             << std::endl;
+  std::cout << "  Setup bytes:       " << setup_comm_bytes << std::endl;
+  std::cout << "  Online bytes:      " << online_comm_bytes << std::endl;
+  std::cout << "  Total bytes:       " << total_comm_bytes << std::endl;
 }
 
 
@@ -579,10 +589,9 @@ void ConfigureReferenceParams(ProtocolParams* params, size_t nx, size_t ny) {
   params->ks = 4;
   params->hash_func_count =
       GetEnvSize("PSU_HASH_FUNC_COUNT", params->hash_func_count);
-  params->use_permutation_hashing =
-      EnvFlagEnabled("PSU_PERMUTATION_HASHING");
-  if (std::getenv("PSU_USE_DH_OPRF") != nullptr) {
-    params->use_dh_oprf = EnvFlagEnabled("PSU_USE_DH_OPRF");
+  params->use_permutation_hashing = false;
+  if (std::getenv("PSU_USE_SALTED_HASH") != nullptr) {
+    params->use_salted_hash = EnvFlagEnabled("PSU_USE_SALTED_HASH");
   }
   params->use_circuit_peqt = EnvFlagEnabled("PSU_CIRCUIT_PEQT");
   params->drop_first_poly = EnvFlagEnabled("PSU_DROP_FIRST_POLY");
@@ -612,15 +621,11 @@ void ConfigureReferenceParams(ProtocolParams* params, size_t nx, size_t ny) {
   params->alpha = GetEnvSize("PSU_ALPHA", params->alpha);
   params->max_items_per_bin =
       GetEnvSize("PSU_MAX_ITEMS_PER_BIN", params->max_items_per_bin);
-  params->sigma1_bits = ComputePolyLinkHashBits(nx, ny, params->lambda);
-  const size_t finalize_ks = params->ks;
-  params->sigma2_bits =
-      (params->EffectiveItemBitCount() + finalize_ks - 1) / finalize_ks;
-  params->plain_modulus =
-      ChoosePlainModulus(params->poly_modulus_degree, params->sigma2_bits);
-  params->plain_modulus =
-      static_cast<uint64_t>(GetEnvSize("PSU_PLAIN_MODULUS",
-                                       params->plain_modulus));
+  params->public_sub_bin_size = GetEnvSize("PSU_PUBLIC_SUB_BIN_SIZE", 0);
+  params->sigma1_bits = GetEnvSize("PSU_SIGMA1_BITS", 128);
+  UPSU_ENFORCE(params->sigma1_bits == 128, "revised protocol hashes full 128-bit encodings");
+  params->plain_modulus = static_cast<uint64_t>(GetEnvSize("PSU_PLAIN_MODULUS", 65537));
+  params->Finalize();
   params->ps_low_degree = GetEnvSize("PSU_PS_LOW_DEGREE", 0);
   params->query_powers = ParseQueryPowersEnv("PSU_QUERY_POWERS");
   params->response_mod_switch_steps =
@@ -707,8 +712,8 @@ SweepMetrics RunLocalPsuOnce(size_t nx, size_t ny, size_t cap,
     run.ote_bytes = ote_result.bytes;
     run.ote_backend = ote_result.backend;
     const size_t recovered_y_unique = static_cast<size_t>(std::count_if(
-        ote_result.values.begin(), ote_result.values.end(),
-        [](uint64_t value) { return value != 0; }));
+        ote_result.present.begin(), ote_result.present.end(),
+        [](uint8_t value) { return value != 0; }));
     const size_t true_intersection = std::min(std::min(cap, ny), nx);
     run.union_cardinality = nx + recovered_y_unique;
     run.true_union = nx + ny - true_intersection;
@@ -848,7 +853,24 @@ std::shared_ptr<upsu::net::Context> MakeBrpcLink(const std::string& parties,
   return upsu::net::Context::Connect(hosts, rank, timeout_ms);
 }
 
+void PrintS3mtStage(const std::shared_ptr<upsu::net::Context>& ctx,
+                   double stage_wall_seconds, const OnlineStats& stats) {
+  const auto link=ctx->GetStats();
+  const size_t wire=link->sent_bytes.load()+link->recv_bytes.load();
+  const size_t excluded=stats.fhe_key_comm_bytes+stats.encoding_comm_bytes;
+  UPSU_ENFORCE(wire>=excluded,"invalid S3MT communication accounting");
+  const size_t bytes=wire-excluded+stats.peqt_local_sent_bytes+
+      stats.peqt_local_recv_bytes+stats.perm_apply_bytes;
+  std::cout << "  S3MT online time:   "
+            << std::max(0.0,stage_wall_seconds-stats.setup_time_s-stats.encoding_time_s)
+            << " s" << std::endl;
+  std::cout << "  S3MT online bytes:  " << bytes << std::endl;
+  std::cout << "  FHE saved bytes:    " << upsu::serialization::SavedBytes() << std::endl;
+  std::cout << "  FHE key saved bytes: " << stats.fhe_key_saved_bytes << std::endl;
+}
+
 int RunDistributedRole() {
+  upsu::set_experiment_phase(true, "local_preprocessing");
   const std::string mode = GetEnvString("PSU_MODE", "list-profiles");
   const bool is_receiver = (mode == "receiver");
   const bool is_sender = (mode == "sender");
@@ -886,7 +908,7 @@ int RunDistributedRole() {
             << ", parties: " << parties << std::endl;
   std::cout << "|X|=" << nx << ", |Y|=" << ny << ", |X∩Y|=" << cap
             << std::endl;
-  const size_t fhe_key_comm_bytes = EstimateFheKeyCommBytes(params);
+  
   auto ctx = MakeBrpcLink(parties, rank);
   constexpr char kReadyTag[] = "UPSI:ready";
 
@@ -900,7 +922,7 @@ int RunDistributedRole() {
     std::chrono::duration<double> sender_offline_elapsed =
         sender_offline_end - sender_offline_start;
 
-    upsu::set_num_threads(online_thread_count);
+    if (!upsu::experiment_phase_threads_enabled()) upsu::set_num_threads(online_thread_count);
     const char ready = 1;
     ctx->SendAsync(ctx->NextRank(), upsu::Bytes(&ready, 1),
                    kReadyTag);
@@ -908,6 +930,7 @@ int RunDistributedRole() {
     auto online_start = std::chrono::high_resolution_clock::now();
     auto receiver_share =
         SendPreparedDirectOteChoices(ctx, prepared, params, &sender_online_stats);
+    const auto s3mt_end=std::chrono::high_resolution_clock::now();
     auto ote_result = ote::RunEqValueReceiverRole(ctx, receiver_share);
     auto online_end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> online_elapsed = online_end - online_start;
@@ -929,11 +952,23 @@ int RunDistributedRole() {
         peqt_local_comm_bytes + sender_online_stats.peqt_link_sent_bytes +
         sender_online_stats.peqt_link_recv_bytes;
     const size_t recovered_y_unique = static_cast<size_t>(std::count_if(
-        ote_result.values.begin(), ote_result.values.end(),
-        [](uint64_t v) { return v != 0; }));
+        ote_result.present.begin(), ote_result.present.end(),
+        [](uint8_t v) { return v != 0; }));
     const size_t union_cardinality = nx + recovered_y_unique;
     const size_t true_intersection = std::min(std::min(cap, ny), nx);
     const size_t true_union = nx + ny - true_intersection;
+    auto expected_non_members = EncodeItemsForFinalOte(
+        CreateRangeItems(nx, ny - true_intersection));
+    std::vector<uint128_t> recovered_non_members;
+    for (size_t i = 0; i < ote_result.values.size(); ++i) {
+      if (ote_result.present[i]) recovered_non_members.push_back(ote_result.values[i]);
+    }
+    std::sort(expected_non_members.begin(), expected_non_members.end());
+    std::sort(recovered_non_members.begin(), recovered_non_members.end());
+    UPSU_ENFORCE(recovered_non_members == expected_non_members,
+                 "complete union verification failed: recovered {}, expected {}",
+                 recovered_non_members.size(),expected_non_members.size());
+    std::cout << "  Complete union verified: yes" << std::endl;
 
     PrintSinglePartyStats(
         std::string("Polynomial Links-") +
@@ -942,7 +977,7 @@ int RunDistributedRole() {
         "receiver", ctx, online_time_s, union_cardinality, true_union,
         sender_offline_elapsed.count(),
         sender_offline_elapsed.count() + online_wall_s, timing_only,
-        fhe_key_comm_bytes, setup_time_s, online_wall_s,
+        sender_online_stats.fhe_key_comm_bytes, setup_time_s, online_wall_s,
         sender_online_stats.peqt_time_s, perm_setup_time_s, peqt_setup_time_s,
         perm_apply_time_s, perm_setup_comm_bytes, peqt_setup_comm_bytes,
         perm_apply_comm_bytes,
@@ -955,6 +990,7 @@ int RunDistributedRole() {
     std::cout << "  PSU OTE bytes:     " << ote_result.bytes << std::endl;
     std::cout << "  PSU OTE time:      " << ote_result.time_s << " s"
               << std::endl;
+    PrintS3mtStage(ctx,std::chrono::duration<double>(s3mt_end-online_start).count(),sender_online_stats);
     if (ote_result.backend == ote::Backend::kSilent) {
       std::cout << "  NOTE: silent OTE bytes are out-of-band and not included in"
                    " link comm stats"
@@ -970,8 +1006,10 @@ int RunDistributedRole() {
   auto online_start = std::chrono::high_resolution_clock::now();
   auto direct_ote_inputs =
       RecvDirectOteSenderInputs(ctx, y, params, &receiver_online_stats);
+  const auto s3mt_end=std::chrono::high_resolution_clock::now();
   auto ote_result = ote::RunEqValueSenderRole(
-      ctx, direct_ote_inputs.sender_values, direct_ote_inputs.sender_share);
+      ctx, direct_ote_inputs.sender_values, direct_ote_inputs.sender_share,
+      direct_ote_inputs.sender_valid);
   auto online_end = std::chrono::high_resolution_clock::now();
   std::chrono::duration<double> online_elapsed = online_end - online_start;
   const double online_wall_s = online_elapsed.count();
@@ -997,7 +1035,7 @@ int RunDistributedRole() {
           ProtocolOutputName() +
           " (distributed)",
       "sender", ctx, online_time_s, std::nullopt, std::nullopt, -1.0,
-      -1.0, timing_only, fhe_key_comm_bytes, setup_time_s, online_wall_s,
+      -1.0, timing_only, receiver_online_stats.fhe_key_comm_bytes, setup_time_s, online_wall_s,
       receiver_online_stats.peqt_time_s, perm_setup_time_s, peqt_setup_time_s,
       perm_apply_time_s, perm_setup_comm_bytes, peqt_setup_comm_bytes,
       perm_apply_comm_bytes, peqt_comm_bytes,
@@ -1009,6 +1047,7 @@ int RunDistributedRole() {
   std::cout << "  PSU OTE bytes:     " << ote_result.bytes << std::endl;
   std::cout << "  PSU OTE time:      " << ote_result.time_s << " s"
             << std::endl;
+  PrintS3mtStage(ctx,std::chrono::duration<double>(s3mt_end-online_start).count(),receiver_online_stats);
   if (ote_result.backend == ote::Backend::kSilent) {
     std::cout << "  NOTE: silent OTE bytes are out-of-band and not included in"
                  " link comm stats"
@@ -1043,7 +1082,7 @@ int RunS3mtDistributedRole() {
 
   ProtocolParams params;
   ConfigureReferenceParams(&params, nx, ny);
-  params.use_dh_oprf = false;
+  params.use_salted_hash = false;
   params.reveal_match_items = true;
   if (const char* depth_env = std::getenv("PSU_QUERY_DEPTH")) {
     params.query_powers_max_depth =
@@ -1087,7 +1126,7 @@ int RunS3mtDistributedRole() {
     const double setup_time_s = sender_online_stats.setup_time_s;
     const double perm_setup_time_s = sender_online_stats.perm_setup_time_s;
     const double peqt_setup_time_s = sender_online_stats.peqt_setup_time_s;
-    const double online_time_s = std::max(0.0, online_wall_s - setup_time_s);
+    const double online_time_s = std::max(0.0, online_wall_s - setup_time_s - sender_online_stats.encoding_time_s);
     const double perm_apply_time_s = sender_online_stats.perm_apply_time_s;
     const size_t perm_setup_comm_bytes = sender_online_stats.perm_setup_bytes;
     const size_t peqt_setup_comm_bytes =
@@ -1100,16 +1139,16 @@ int RunS3mtDistributedRole() {
     const size_t peqt_comm_bytes =
         peqt_local_comm_bytes + sender_online_stats.peqt_link_sent_bytes +
         sender_online_stats.peqt_link_recv_bytes;
-    const size_t fhe_key_comm_bytes = EstimateFheKeyCommBytes(params);
+    
 
     PrintSinglePartyStats(
         "S³MT (distributed)", "receiver", ctx, online_time_s, std::nullopt,
         std::nullopt, sender_offline_elapsed.count(),
         sender_offline_elapsed.count() + online_wall_s, false,
-        fhe_key_comm_bytes, setup_time_s, online_wall_s,
+        sender_online_stats.fhe_key_comm_bytes, setup_time_s, online_wall_s,
         sender_online_stats.peqt_time_s, perm_setup_time_s, peqt_setup_time_s,
         perm_apply_time_s, perm_setup_comm_bytes, peqt_setup_comm_bytes,
-        perm_apply_comm_bytes, peqt_comm_bytes, peqt_local_comm_bytes, 0);
+        perm_apply_comm_bytes, peqt_comm_bytes, peqt_local_comm_bytes, 0, sender_online_stats.encoding_comm_bytes);
 
     if (!sender_choice_share.empty()) {
       ctx->SendAsync(ctx->NextRank(),
@@ -1139,7 +1178,7 @@ int RunS3mtDistributedRole() {
   const double setup_time_s = receiver_online_stats.setup_time_s;
   const double perm_setup_time_s = receiver_online_stats.perm_setup_time_s;
   const double peqt_setup_time_s = receiver_online_stats.peqt_setup_time_s;
-  const double online_time_s = std::max(0.0, online_wall_s - setup_time_s);
+  const double online_time_s = std::max(0.0, online_wall_s - setup_time_s - receiver_online_stats.encoding_time_s);
   const double perm_apply_time_s = receiver_online_stats.perm_apply_time_s;
   const size_t perm_setup_comm_bytes = receiver_online_stats.perm_setup_bytes;
   const size_t peqt_setup_comm_bytes =
@@ -1152,15 +1191,15 @@ int RunS3mtDistributedRole() {
   const size_t peqt_comm_bytes =
       peqt_local_comm_bytes + receiver_online_stats.peqt_link_sent_bytes +
       receiver_online_stats.peqt_link_recv_bytes;
-  const size_t fhe_key_comm_bytes = EstimateFheKeyCommBytes(params);
+  
 
   PrintSinglePartyStats(
       "S³MT (distributed)", "sender", ctx, online_time_s, std::nullopt,
-      std::nullopt, -1.0, -1.0, false, fhe_key_comm_bytes, setup_time_s,
+      std::nullopt, -1.0, -1.0, false, receiver_online_stats.fhe_key_comm_bytes, setup_time_s,
       online_wall_s, receiver_online_stats.peqt_time_s, perm_setup_time_s,
       peqt_setup_time_s, perm_apply_time_s, perm_setup_comm_bytes,
       peqt_setup_comm_bytes, perm_apply_comm_bytes, peqt_comm_bytes,
-      peqt_local_comm_bytes, 0);
+      peqt_local_comm_bytes, 0, receiver_online_stats.encoding_comm_bytes);
 
   auto sender_share_buf = ctx->Recv(ctx->PrevRank(), kS3mtChoiceShareTag);
   UPSU_ENFORCE(static_cast<size_t>(sender_share_buf.size()) ==
@@ -1168,15 +1207,15 @@ int RunS3mtDistributedRole() {
                "S³MT sender-share size mismatch: got {}, expect {}",
                sender_share_buf.size(), s3mt_output.choice_share.size());
 
-  std::vector<uint64_t> recovered_values;
+  std::vector<uint128_t> recovered_values;
   recovered_values.reserve(s3mt_output.aligned_values.size());
   for (size_t i = 0; i < s3mt_output.choice_share.size(); ++i) {
     const uint8_t sender_share =
         static_cast<const uint8_t*>(sender_share_buf.data())[i];
     const uint8_t match =
         static_cast<uint8_t>((sender_share ^ s3mt_output.choice_share[i]) & 1U);
-    const uint64_t value = s3mt_output.aligned_values[i];
-    if (match == 0 && value != 0) {
+    const uint128_t value = s3mt_output.aligned_values[i];
+    if (match == 0 && s3mt_output.aligned_valid[i]) {
       recovered_values.push_back(value);
     }
   }
@@ -1186,10 +1225,10 @@ int RunS3mtDistributedRole() {
       recovered_values.end());
 
   auto expected_values = EncodeItemsForFinalOte(y);
-  std::vector<uint64_t> expected_non_members;
+  std::vector<uint128_t> expected_non_members;
   expected_non_members.reserve(expected_values.size());
   for (size_t i = 0; i < y.size(); ++i) {
-    if (static_cast<size_t>(std::strtoull(y[i].c_str(), nullptr, 10)) >= nx) {
+    if (i >= std::min(cap, ny)) {
       expected_non_members.push_back(expected_values[i]);
     }
   }
@@ -1255,6 +1294,9 @@ void PrintPrimitiveBenchStats(const std::string& name,
             << " MB" << std::endl;
   std::cout << "  Total comm (S↔R):  " << BytesToMB(metrics.total_comm_bytes)
             << " MB" << std::endl;
+  std::cout << "  Setup bytes:       " << metrics.setup_comm_bytes << std::endl;
+  std::cout << "  Online bytes:      " << metrics.online_comm_bytes << std::endl;
+  std::cout << "  Total bytes:       " << metrics.total_comm_bytes << std::endl;
   std::cout << "  Output ones:       " << metrics.result_true_count
             << " (expect: " << metrics.expected_true_count << ")"
             << (metrics.correct ? " [CORRECT]" : " [WRONG!]") << std::endl;
@@ -1689,7 +1731,7 @@ int RunAlphaSweep() {
   const auto sender_items = CreateRangeItems(0, nx);
   for (size_t trial = 1; trial <= trials; ++trial) {
     const auto begin = std::chrono::high_resolution_clock::now();
-    const auto metrics = SampleAlphaAfterOprf(sender_items, ny, params);
+    const auto metrics = SampleAlphaAfterEncoding(sender_items, ny, params);
     const auto end = std::chrono::high_resolution_clock::now();
     const double elapsed_s = std::chrono::duration<double>(end - begin).count();
 

@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.20)
 project(upsu VERSION 1.0.0 LANGUAGES C CXX)
 
 include(cmake/VerifyEnvironment.cmake)
@@ -15,6 +15,18 @@ find_package(Threads REQUIRED)
 find_package(OpenMP REQUIRED)
 find_library(NTL_LIBRARY NAMES ntl REQUIRED)
 find_library(GMP_LIBRARY NAMES gmp REQUIRED)
+find_path(NTL_INCLUDE_DIR NTL/lzz_p.h REQUIRED)
+find_path(GMP_INCLUDE_DIR gmp.h REQUIRED)
+
+set(BLAKE3_USE_TBB OFF CACHE BOOL "" FORCE)
+set(BLAKE3_FETCH_TBB OFF CACHE BOOL "" FORCE)
+set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(blake3
+  GIT_REPOSITORY https://github.com/BLAKE3-team/BLAKE3.git
+  GIT_TAG 1.8.2
+  GIT_SHALLOW TRUE
+  SOURCE_SUBDIR c)
+FetchContent_MakeAvailable(blake3)
 
 set(FMT_INSTALL OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(fmt
@@ -23,12 +35,19 @@ FetchContent_Declare(fmt
   GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(fmt)
 
-set(SEAL_BUILD_DEPS OFF CACHE BOOL "" FORCE)
+option(UPSU_USE_INSTALLED_PROTOCOL_DEPS "Use installed SEAL, libOTe and secureJoin packages" OFF)
+if(UPSU_USE_INSTALLED_PROTOCOL_DEPS)
+  find_package(SEAL 4.1 REQUIRED CONFIG)
+  find_package(secureJoin REQUIRED CONFIG)
+  set(UPSU_SECURE_JOIN_TARGET visa::secureJoin)
+  set(UPSU_LIBOTE_TARGET oc::libOTe)
+else()
+set(SEAL_BUILD_DEPS ON CACHE BOOL "" FORCE)
 set(SEAL_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(SEAL_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(SEAL_USE_ZLIB OFF CACHE BOOL "" FORCE)
 set(SEAL_USE_ZSTD OFF CACHE BOOL "" FORCE)
-set(SEAL_USE_INTEL_HEXL OFF CACHE BOOL "" FORCE)
+set(SEAL_USE_INTEL_HEXL ON CACHE BOOL "" FORCE)
 set(SEAL_USE_MSGSL OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(seal
   GIT_REPOSITORY https://github.com/microsoft/SEAL.git
@@ -138,22 +157,48 @@ target_compile_definitions(secure_join_impl PUBLIC mMultType=mLpnMultType)
 target_compile_options(secure_join_impl PRIVATE
   -fpermissive -Wno-unused-parameter -Wno-unused-variable -Wno-sign-compare)
 target_link_libraries(secure_join_impl PUBLIC libOTe)
+set(UPSU_SECURE_JOIN_TARGET secure_join_impl)
+set(UPSU_LIBOTE_TARGET libOTe)
+endif()
 
 add_executable(psu
-  main.cc unbalanced_psu.cc polynomial_links.cc dh_oprf.cc response_sanitizer.cc
+  main.cc unbalanced_psu.cc polynomial_links.cc response_sanitizer.cc
   GMW/Circuit.cpp GMW/Gmw.cpp GMW/SilentTripleGen.cpp
   src/common.cc src/parallel.cc src/net_context.cc src/powers_dag.cc)
+target_sources(psu PRIVATE src/serialization.cc)
+target_sources(psu PRIVATE src/input_encoding.cc)
+target_link_libraries(psu PRIVATE BLAKE3::blake3)
+option(UPSU_ENABLE_ZSTD "Lossless compression of serialized FHE objects" ON)
+if(UPSU_ENABLE_ZSTD)
+  find_path(UPSU_ZSTD_INCLUDE zstd.h REQUIRED)
+  find_library(UPSU_ZSTD_LIBRARY NAMES zstd REQUIRED)
+  target_include_directories(psu PRIVATE "${UPSU_ZSTD_INCLUDE}")
+  target_link_libraries(psu PRIVATE "${UPSU_ZSTD_LIBRARY}")
+  target_compile_definitions(psu PRIVATE UPSU_HAVE_ZSTD)
+endif()
 target_include_directories(psu PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}"
-  "${CMAKE_CURRENT_SOURCE_DIR}/include")
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+  "${NTL_INCLUDE_DIR}" "${GMP_INCLUDE_DIR}")
+target_compile_definitions(psu PRIVATE mMultType=mLpnMultType)
 target_compile_options(psu PRIVATE
   -O3 -maes -mbmi2 -mpclmul -msse4.1 -mavx -mavx2
   -Wno-unused-parameter -Wno-redundant-move -Wno-ignored-qualifiers
   -Wno-deprecated-copy)
 target_link_options(psu PRIVATE -no-pie -Wl,--allow-multiple-definition)
 target_link_libraries(psu PRIVATE
-  secure_join_impl libOTe SEAL::seal fmt::fmt OpenSSL::SSL OpenSSL::Crypto
+  ${UPSU_SECURE_JOIN_TARGET} ${UPSU_LIBOTE_TARGET} SEAL::seal fmt::fmt OpenSSL::SSL OpenSSL::Crypto
   OpenMP::OpenMP_CXX Threads::Threads ${NTL_LIBRARY} ${GMP_LIBRARY} dl)
+set(UPSU_CPU_FEATURES_LIBRARY "" CACHE FILEPATH "CPU-features library for installed SEAL/HEXL packages without transitive linkage")
+if(UPSU_CPU_FEATURES_LIBRARY)
+  target_link_libraries(psu PRIVATE "${UPSU_CPU_FEATURES_LIBRARY}")
+endif()
+
+add_executable(salted_hash_regression EXCLUDE_FROM_ALL
+  salted_hash_regression.cc src/input_encoding.cc src/common.cc src/parallel.cc)
+target_include_directories(salted_hash_regression PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_compile_options(salted_hash_regression PRIVATE -O3)
+target_link_libraries(salted_hash_regression PRIVATE BLAKE3::blake3 fmt::fmt OpenSSL::Crypto Threads::Threads)
 
 install(TARGETS psu RUNTIME DESTINATION bin)
 install(FILES settings.json DESTINATION share/upsu)

@@ -1,8 +1,15 @@
 
 #include "unbalanced_psu.h"
+#include "upsu/benchmark_diagnostics.h"
+#include "upsu/paper_encoding.h"
+#include "upsu/paper_placement.h"
+#include "upsu/paper_powers.h"
+#include "upsu/fused_ntt.h"
 #include "upsu/common.h"
 #include "upsu/net/context.h"
 #include "upsu/parallel.h"
+#include "upsu/item.h"
+#include "upsu/serialization.h"
 
 #include <algorithm>
 #include <array>
@@ -38,7 +45,6 @@
 #include "coproto/coproto.h"
 #include "cryptoTools/Common/Defines.h"
 #include "cryptoTools/Crypto/PRNG.h"
-#include "dh_oprf.h"
 #include "polynomial_links.h"
 #include "peqt.h"
 #include "response_sanitizer.h"
@@ -181,23 +187,15 @@ uint128_t PackFieldElements(const std::vector<uint64_t>& elems,
   return packed;
 }
 
-std::vector<uint64_t> EncodeItemsForFinalOteImpl(
+std::vector<uint128_t> EncodeItemsForFinalOteImpl(
     const std::vector<std::string>& items) {
-  std::vector<uint64_t> out(items.size(), 0);
+  std::vector<uint128_t> out(items.size(), 0);
   upsu::parallel_for(
       0, static_cast<int64_t>(items.size()),
       [&](int64_t begin, int64_t end) {
         for (int64_t idx = begin; idx < end; ++idx) {
           const std::string& item = items[static_cast<size_t>(idx)];
-          uint64_t value = 0;
-          const char* begin_ptr = item.data();
-          const char* end_ptr = item.data() + item.size();
-          const auto [ptr, ec] =
-              std::from_chars(begin_ptr, end_ptr, value, 10);
-          UPSU_ENFORCE(ec == std::errc{} && ptr == end_ptr,
-                       "final OTE only supports decimal uint64 items, got='{}'",
-                       item);
-          out[static_cast<size_t>(idx)] = value;
+          out[static_cast<size_t>(idx)] = upsu::ParseItem(item);
         }
       });
   return out;
@@ -358,6 +356,7 @@ bool PermutedPeqtEnabled(const ProtocolParams& params) {
 }
 
 size_t PermThreadCount() {
+  if (upsu::experiment_phase_threads_enabled()) return upsu::get_num_threads();
   const char* env = std::getenv("PSU_PERM_THREADS");
   if (!env || !*env) {
     return 1;
@@ -411,6 +410,7 @@ std::vector<uint128_t> ByteMatrixToU128Vec(const oc::Matrix<oc::u8>& matrix,
 
 PermSenderState SetupPermutedPeqtSender(size_t row_count, size_t row_bytes,
                                         OnlineStats* online_stats) {
+  const auto start = std::chrono::high_resolution_clock::now();
   PermSenderState state;
   state.row_bytes = row_bytes;
   TraceStage("perm-send", fmt::format("listening on {} for {} rows",
@@ -430,7 +430,6 @@ PermSenderState SetupPermutedPeqtSender(size_t row_count, size_t row_bytes,
   generator.preprocess();
   TraceStage("perm-send", "secure-join generator initialized");
 
-  const auto start = std::chrono::high_resolution_clock::now();
   const auto bytes_begin = TakeSocketCommSnapshot(state.sock);
   auto tasks = coproto::sync_wait(coproto::when_all_ready(
       cor.start(),
@@ -485,6 +484,7 @@ secJoin::Perm BuildBlockPermutation(size_t row_count, size_t block_size,
 PermReceiverState SetupPermutedPeqtReceiver(size_t row_count, size_t row_bytes,
                                             size_t block_size,
                                             OnlineStats* online_stats) {
+  const auto start = std::chrono::high_resolution_clock::now();
   PermReceiverState state;
   state.row_bytes = row_bytes;
   state.block_size = block_size;
@@ -506,7 +506,6 @@ PermReceiverState SetupPermutedPeqtReceiver(size_t row_count, size_t row_bytes,
   generator.preprocess();
   TraceStage("perm-recv", "secure-join generator initialized");
 
-  const auto start = std::chrono::high_resolution_clock::now();
   const auto bytes_begin = TakeSocketCommSnapshot(state.sock);
   auto tasks = coproto::sync_wait(coproto::when_all_ready(
       cor.start(),
@@ -671,6 +670,12 @@ void TraceStage(const char* role, const std::string& message) {
   if (!TraceEnabled()) {
     return;
   }
+  if (std::getenv("PSU_TRACE_TIMES")) {
+    static const auto start = std::chrono::steady_clock::now();
+    const double elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start).count();
+    std::cerr << "[stage_seconds=" << elapsed << "] ";
+  }
   std::cerr << "[psu:" << role << "] " << message << std::endl;
 }
 
@@ -710,19 +715,8 @@ uint64_t SimpleHashBin(uint128_t item, size_t hash_idx, size_t num_bins) {
 }
 
 uint64_t TableHashBin(const HashedTableItem& item, size_t hash_idx,
-                      size_t table_size, bool use_permutation_hashing,
-                      size_t permutation_index_bits) {
-  const uint64_t suffix_hash =
-      SimpleHashBin(item.stored_item, hash_idx, table_size);
-  if (!use_permutation_hashing) {
-    return suffix_hash;
-  }
-  const uint64_t prefix =
-      static_cast<uint64_t>(MaskBits(item.full_item, permutation_index_bits));
-  if (IsPowerOfTwo(table_size)) {
-    return prefix ^ suffix_hash;
-  }
-  return (prefix + suffix_hash) % table_size;
+                      size_t table_size, bool, size_t) {
+  return paper::CandidateBins(item.full_item, table_size).at(hash_idx - 1);
 }
 
 uint64_t MulMod(uint64_t a, uint64_t b, uint64_t p) {
@@ -741,6 +735,11 @@ uint32_t MulMod65537(uint32_t a, uint32_t b) {
 }
 
 void MulMod65537ArrayInPlace(uint32_t* power, const uint32_t* base, size_t n) {
+  if (paper::Avx512Enabled()) {
+    const size_t processed = paper::Mul65537Avx512(power, base, n);
+    for (size_t i = processed; i < n; ++i) power[i] = MulMod65537(power[i], base[i]);
+    return;
+  }
 #if defined(__AVX2__)
   constexpr int64_t kPrime = 65537;
   const __m256i zero = _mm256_setzero_si256();
@@ -899,16 +898,9 @@ size_t EffectiveItemBitCount(size_t sigma1_bits, size_t table_size,
   return sigma1_bits - reduction_bits;
 }
 
-HashedTableItem BuildHashedTableItem(uint128_t full_item, size_t sigma1_bits,
-                                     size_t table_size,
-                                     bool use_permutation_hashing) {
-  const uint128_t masked_item = MaskBits(full_item, sigma1_bits);
-  if (!use_permutation_hashing) {
-    return HashedTableItem{masked_item, masked_item};
-  }
-
-  const size_t permutation_bits = FloorLog2(table_size);
-  return HashedTableItem{masked_item, masked_item >> permutation_bits};
+HashedTableItem BuildHashedTableItem(uint128_t full_item, size_t payload_bits,
+                                     size_t, bool) {
+  return HashedTableItem{full_item, MaskBits(full_item, payload_bits)};
 }
 
 std::vector<HashedTableItem> BuildHashedTableItems(
@@ -1052,13 +1044,19 @@ template <typename T>
 std::string SerializeSealObject(const T& obj) {
   std::stringstream ss;
   obj.save(ss);
-  return ss.str();
+  return upsu::serialization::Pack(ss.str());
 }
 
 template <typename T>
 T DeserializeSealObject(const std::shared_ptr<seal::SEALContext>& context,
                         const uint8_t* blob_data, size_t blob_size) {
   T obj;
+  std::string unpacked;
+  if(upsu::serialization::IsCompressed(blob_data,blob_size)) {
+    unpacked=upsu::serialization::Unpack(blob_data,blob_size);
+    blob_data=reinterpret_cast<const uint8_t*>(unpacked.data());
+    blob_size=unpacked.size();
+  }
   SpanInputStreamBuf buffer(blob_data, blob_size);
   std::istream input(&buffer);
   obj.load(*context, input);
@@ -1074,6 +1072,12 @@ T DeserializeSealObject(const std::shared_ptr<seal::SEALContext>& context,
 
 template <typename T>
 void AppendSerializedSealObject(std::vector<uint8_t>* out, const T& obj) {
+  if(upsu::serialization::CompressionEnabled()) {
+    auto bytes=SerializeSealObject(obj);
+    AppendU64(out,bytes.size());
+    out->insert(out->end(),bytes.begin(),bytes.end());
+    return;
+  }
   const size_t size_pos = out->size();
   AppendU64(out, 0);
   const size_t payload_begin = out->size();
@@ -1189,86 +1193,7 @@ std::set<std::uint32_t> BuildTargetPowerSet(size_t max_degree,
 std::set<std::uint32_t> BuildSourcePowerSet(
     const std::set<std::uint32_t>& target_powers, size_t max_depth,
     const std::vector<std::uint32_t>& explicit_query_powers) {
-  if (target_powers.empty()) {
-    return {};
-  }
-
-  if (!explicit_query_powers.empty()) {
-    std::set<std::uint32_t> source_powers;
-    const std::uint32_t max_target = *target_powers.rbegin();
-    for (std::uint32_t power : explicit_query_powers) {
-      if (power >= 1 && power <= max_target) {
-        source_powers.insert(power);
-      }
-    }
-    if (source_powers.count(1) > 0) {
-      upsu::PowersDag dag;
-      if (dag.configure(source_powers, target_powers)) {
-        return source_powers;
-      }
-      TraceStage("params",
-                 "explicit query powers cannot derive target set; falling "
-                 "back to automatic source-power selection");
-    } else {
-      TraceStage("params",
-                 "explicit query powers omit 1 after truncation; falling back "
-                 "to automatic source-power selection");
-    }
-  }
-
-  if (max_depth == 0 || target_powers.size() <= 1) {
-    return target_powers;
-  }
-
-  std::set<std::uint32_t> source_powers = {1};
-  upsu::PowersDag dag;
-  bool configured = dag.configure(source_powers, target_powers);
-  if (configured && dag.depth() <= max_depth) {
-    return source_powers;
-  }
-
-  while (source_powers.size() < target_powers.size()) {
-    bool found_candidate = false;
-    std::uint32_t best_candidate = 0;
-    std::uint32_t best_depth = std::numeric_limits<std::uint32_t>::max();
-
-    for (std::uint32_t candidate : target_powers) {
-      if (candidate <= 1) {
-        continue;
-      }
-      if (source_powers.count(candidate)) {
-        continue;
-      }
-
-      auto trial_sources = source_powers;
-      trial_sources.insert(candidate);
-      upsu::PowersDag trial_dag;
-      if (!trial_dag.configure(trial_sources, target_powers)) {
-        continue;
-      }
-
-      std::uint32_t trial_depth = trial_dag.depth();
-      if (!found_candidate || trial_depth < best_depth ||
-          (trial_depth == best_depth && candidate > best_candidate)) {
-        found_candidate = true;
-        best_candidate = candidate;
-        best_depth = trial_depth;
-      }
-    }
-
-    UPSU_ENFORCE(found_candidate,
-                 "failed to choose source powers for target set");
-    source_powers.insert(best_candidate);
-
-    upsu::PowersDag updated_dag;
-    configured = updated_dag.configure(source_powers, target_powers);
-    UPSU_ENFORCE(configured, "source power set became invalid");
-    if (updated_dag.depth() <= max_depth) {
-      return source_powers;
-    }
-  }
-
-  return source_powers;
+  return paper::SourcePowers(target_powers, max_depth, explicit_query_powers);
 }
 
 std::vector<std::uint32_t> ToSortedVector(
@@ -1313,45 +1238,6 @@ struct CuckooTable {
         occupied(table_size_arg, false),
         is_spy(table_size_arg, false) {}
 
-  bool Insert(const HashedTableItem& item, size_t item_id) {
-    uint128_t cur_full_item = item.full_item;
-    uint128_t cur_stored_item = item.stored_item;
-    size_t cur_item_id = item_id;
-    uint8_t start_hash =
-        static_cast<uint8_t>(upsu::SecureRandU64() % kHashCount + 1);
-
-    for (size_t iter = 0; iter < kMaxIter; ++iter) {
-      for (size_t offset = 0; offset < kHashCount; ++offset) {
-        const uint8_t hash_id =
-            static_cast<uint8_t>((start_hash + offset - 1) % kHashCount + 1);
-        const size_t bin = static_cast<size_t>(TableHashBin(
-            HashedTableItem{cur_full_item, cur_stored_item}, hash_id,
-            table_size, use_permutation_hashing, permutation_index_bits));
-        if (!occupied[bin]) {
-          bins[bin] = cur_stored_item;
-          full_bins[bin] = cur_full_item;
-          item_ids[bin] = cur_item_id;
-          occupied[bin] = true;
-          return true;
-        }
-      }
-
-      const uint8_t evict_hash =
-          static_cast<uint8_t>(upsu::SecureRandU64() % kHashCount + 1);
-      const size_t bin = static_cast<size_t>(TableHashBin(
-          HashedTableItem{cur_full_item, cur_stored_item}, evict_hash,
-          table_size, use_permutation_hashing, permutation_index_bits));
-      std::swap(cur_stored_item, bins[bin]);
-      std::swap(cur_full_item, full_bins[bin]);
-      std::swap(cur_item_id, item_ids[bin]);
-      occupied[bin] = true;
-      start_hash =
-          static_cast<uint8_t>(upsu::SecureRandU64() % kHashCount + 1);
-    }
-
-    return false;
-  }
-
   void FillSpies(bool enable, size_t stored_item_bits, size_t full_item_bits) {
     if (!enable) {
       return;
@@ -1388,11 +1274,7 @@ struct SimpleHashTable {
     for (size_t i = 0; i < n; ++i) {
       for (size_t j = 0; j < kv; ++j) {
         const auto& sub_item = items[i * kv + j];
-        for (size_t h = 1; h <= 3; ++h) {
-          const size_t bin =
-              static_cast<size_t>(TableHashBin(sub_item, h, num_bins,
-                                               use_permutation_hashing,
-                                               permutation_index_bits));
+        for (size_t bin : paper::CandidateBins(sub_item.full_item, num_bins)) {
           bins[bin].push_back(sub_item.stored_item);
         }
       }
@@ -1420,6 +1302,7 @@ struct BinPolySet {
 struct BatchedPlaintextPolySet {
   std::vector<std::vector<seal::Plaintext>> coeff_plaintexts;
   std::vector<std::vector<seal::Plaintext>> coeff_plaintexts_ntt;
+  std::vector<std::vector<std::vector<uint32_t>>> coeff_quotients;
   std::vector<std::vector<uint8_t>> has_coeff_plaintexts;
   std::vector<std::vector<uint32_t>> normal_non_zero_degrees;
   std::vector<std::vector<uint32_t>> ntt_non_zero_degrees;
@@ -1428,13 +1311,14 @@ struct BatchedPlaintextPolySet {
 
 }
 
-std::vector<uint64_t> EncodeItemsForFinalOte(
+std::vector<uint128_t> EncodeItemsForFinalOte(
     const std::vector<std::string>& items) {
   return EncodeItemsForFinalOteImpl(items);
 }
 
 struct PreparedSender {
-  DhOprf sender_oprf;
+  encoding::Salt encoding_salt{};
+  bool salt_disclosed = false;
   std::vector<std::vector<BinPolySet>> bin_polys;
   std::vector<std::vector<BatchedPlaintextPolySet>> packed_bin_plaintexts;
   std::vector<std::uint32_t> source_power_vec;
@@ -1487,7 +1371,8 @@ uint64_t FirstSliceOfItem(uint128_t item, size_t ks, size_t sigma2_bits,
 PartitionShape EstimatePartitionShape(const SimpleHashTable& sh_table,
                                       size_t alpha_min, size_t ks,
                                       size_t sigma2_bits, uint64_t prime,
-                                      size_t max_items_per_bin) {
+                                      size_t max_items_per_bin,
+                                      size_t public_sub_bin_size = 0) {
   const size_t dense_domain_size =
       (sigma2_bits < 63)
           ? std::min<size_t>(static_cast<size_t>(prime), size_t{1} << sigma2_bits)
@@ -1535,6 +1420,15 @@ PartitionShape EstimatePartitionShape(const SimpleHashTable& sh_table,
       [](size_t lhs, size_t rhs) { return std::max(lhs, rhs); });
 
   PartitionShape shape;
+  if (public_sub_bin_size != 0) {
+    UPSU_ENFORCE(alpha_min >= required_alpha && alpha_min > 0,
+                 "public alpha exceeded by first-slice multiplicity");
+    UPSU_ENFORCE(sh_table.max_bin_size <= alpha_min * public_sub_bin_size,
+                 "public padded bin capacity exceeded");
+    UPSU_ENFORCE(public_sub_bin_size <= max_items_per_bin,
+                 "public degree exceeds the supported maximum");
+    return {.alpha = alpha_min, .sub_bin_size = public_sub_bin_size};
+  }
   shape.alpha = std::max(alpha_min, required_alpha);
   if (max_items_per_bin > 0) {
     const size_t alpha_for_cap =
@@ -1556,7 +1450,8 @@ PartitionedBins BuildPartitionedBins(const SimpleHashTable& sh_table,
                                      size_t item_bit_count,
                                      size_t sigma2_bits, uint64_t prime,
                                      bool require_unique_first_slice,
-                                     size_t max_items_per_bin) {
+                                     size_t max_items_per_bin,
+                                     size_t public_sub_bin_size = 0) {
   PartitionedBins out;
   const size_t group_dense_domain_size =
       (sigma2_bits < 63)
@@ -1564,7 +1459,7 @@ PartitionedBins BuildPartitionedBins(const SimpleHashTable& sh_table,
           : 0;
   const PartitionShape shape =
       EstimatePartitionShape(sh_table, alpha_min, ks, sigma2_bits, prime,
-                             max_items_per_bin);
+                             max_items_per_bin, public_sub_bin_size);
   out.alpha = shape.alpha;
   out.sub_bin_size = shape.sub_bin_size;
   out.bins.assign(sh_table.num_bins,
@@ -1648,73 +1543,35 @@ PartitionedBins BuildPartitionedBins(const SimpleHashTable& sh_table,
   });
 
   upsu::parallel_for(0, sh_table.num_bins, [&](int64_t begin, int64_t end) {
-    const size_t dense_domain_size =
-        (require_unique_first_slice && sigma2_bits < 63)
-            ? std::min<size_t>(static_cast<size_t>(prime),
-                               size_t{1} << sigma2_bits)
-            : 0;
-    std::vector<uint8_t> used_dense;
-    std::vector<uint32_t> touched;
-    if (dense_domain_size > 0 && dense_domain_size <= (1u << 20)) {
-      used_dense.assign(dense_domain_size, 0);
-    }
+    const size_t field_bits = FieldBitWidth(prime);
+    std::vector<uint8_t> used(prime, 0);
+    std::vector<size_t> touched;
+    paper::FieldSampler sampler;
     for (int64_t bin_idx = begin; bin_idx < end; ++bin_idx) {
       for (size_t sub_idx = 0; sub_idx < out.alpha; ++sub_idx) {
         auto& sub_bin = out.bins[bin_idx][sub_idx];
-        if (!require_unique_first_slice) {
-          const size_t original_size = sub_bin.size();
-          sub_bin.resize(out.sub_bin_size);
-          for (size_t item_idx = original_size; item_idx < sub_bin.size();
-               ++item_idx) {
-            sub_bin[item_idx] = RandomMaskedItem(item_bit_count);
-          }
-          continue;
+        touched.clear();
+        for (auto& item : sub_bin) {
+          const auto slices = SliceItem(item, ks, sigma2_bits);
+          const size_t anchor = slices[0];
+          UPSU_ENFORCE(!used[anchor], "duplicate real anchor in partitioned sub-bin");
+          used[anchor] = 1;
+          touched.push_back(anchor);
+          item = PackFieldElements(slices, field_bits);
         }
-
-        if (!used_dense.empty()) {
-          touched.clear();
-          for (uint128_t item : sub_bin) {
-            const uint32_t first = static_cast<uint32_t>(
-                FirstSliceOfItem(item, ks, sigma2_bits, prime));
-            if (!used_dense[first]) {
-              used_dense[first] = 1;
-              touched.push_back(first);
-            }
-          }
-
-          uint32_t next_unused = 0;
-          while (sub_bin.size() < out.sub_bin_size) {
-            while (next_unused < dense_domain_size && used_dense[next_unused]) {
-              ++next_unused;
-            }
-            UPSU_ENFORCE(next_unused < dense_domain_size,
-                         "dense domain exhausted while padding sub-bin");
-            used_dense[next_unused] = 1;
-            touched.push_back(next_unused);
-            sub_bin.push_back(SetFirstSlice(RandomMaskedItem(item_bit_count),
-                                            next_unused, sigma2_bits,
-                                            item_bit_count));
-            ++next_unused;
-          }
-
-          for (uint32_t key : touched) {
-            used_dense[key] = 0;
-          }
-          continue;
-        }
-
-        std::set<uint64_t> used_first;
-        for (uint128_t item : sub_bin) {
-          used_first.insert(FirstSliceOfItem(item, ks, sigma2_bits, prime));
-        }
-
+        UPSU_ENFORCE(sub_bin.size() <= out.sub_bin_size && out.sub_bin_size <= prime,
+                     "public sub-bin capacity exceeded");
         while (sub_bin.size() < out.sub_bin_size) {
-          const uint128_t cand = RandomMaskedItem(item_bit_count);
-          const uint64_t first = FirstSliceOfItem(cand, ks, sigma2_bits, prime);
-          if (used_first.insert(first).second) {
-            sub_bin.push_back(cand);
-          }
+          uint64_t anchor;
+          do { anchor = sampler(prime); } while (used[anchor]);
+          used[anchor] = 1;
+          touched.push_back(anchor);
+          std::vector<uint64_t> slices(ks);
+          slices[0] = anchor;
+          for (size_t j = 1; j < ks; ++j) slices[j] = sampler(prime);
+          sub_bin.push_back(PackFieldElements(slices, field_bits));
         }
+        for (size_t anchor : touched) used[anchor] = 0;
       }
     }
   });
@@ -1738,7 +1595,7 @@ SelectedKsConfig SelectKsConfig(const SimpleHashTable& sh_table,
 
   const PartitionShape shape = EstimatePartitionShape(
       sh_table, params.alpha, candidate_ks, sigma2_bits, prime,
-      params.max_items_per_bin);
+      params.max_items_per_bin, params.public_sub_bin_size);
   if (require_unique_first_slice && sigma2_bits < 63) {
     const size_t max_unique = size_t{1} << sigma2_bits;
     UPSU_ENFORCE(shape.sub_bin_size <= max_unique,
@@ -1782,7 +1639,7 @@ SelectedKsConfig SelectKsConfig(const SimpleHashTable& sh_table,
 
   best.partitioned = BuildPartitionedBins(
       sh_table, params.alpha, best.ks, item_bit_count, best.sigma2_bits, prime,
-      require_unique_first_slice, params.max_items_per_bin);
+      require_unique_first_slice, params.max_items_per_bin, params.public_sub_bin_size);
   return best;
 }
 
@@ -1917,6 +1774,7 @@ seal::Ciphertext EvalPolyOnPackedSlots(
     const std::vector<seal::Ciphertext>& all_powers, size_t output_slice,
     size_t max_degree, size_t ps_low_degree, const seal::RelinKeys& relin_keys,
     seal::Evaluator& evaluator, seal::Encryptor& encryptor,
+    const seal::SEALContext& context,
     const std::vector<seal::Ciphertext>* all_powers_ntt = nullptr) {
   auto eval_direct = [&](size_t coeff_begin,
                          size_t coeff_end,
@@ -1927,7 +1785,21 @@ seal::Ciphertext EvalPolyOnPackedSlots(
     if (use_ntt) {
       seal::Ciphertext acc_ntt;
       bool has_term = false;
+      const char* fused_option = std::getenv("PSU_FUSED_NTT");
+      if (fused_option && std::strcmp(fused_option, "1") == 0) {
+        std::vector<paper::NttProduct> terms;
+        for (uint32_t d : packed_polys.ntt_non_zero_degrees[output_slice]) {
+          if (d <= coeff_begin || d > coeff_end) continue;
+          const size_t power_degree = power_offset + d - coeff_begin;
+          terms.push_back({&all_powers_ntt->at(power_degree),
+                           &packed_polys.coeff_plaintexts_ntt[output_slice][d],
+                           &packed_polys.coeff_quotients[output_slice][d]});
+        }
+        has_term = paper::FusedNttDot(terms, context, acc_ntt);
+      }
+      const bool fused = has_term;
       for (uint32_t d : packed_polys.ntt_non_zero_degrees[output_slice]) {
+        if (fused) break;
         if (d <= coeff_begin || d > coeff_end) {
           continue;
         }
@@ -2006,15 +1878,30 @@ seal::Ciphertext EvalPolyOnPackedSlots(
   }
 
   const size_t step = ps_low_degree + 1;
+  const char* optimized_option = std::getenv("PSU_FUSED_NTT");
+  const bool optimized = optimized_option && std::strcmp(optimized_option, "1") == 0;
+  const size_t poly_degree = optimized && output_slice > 0 ? max_degree - 1 : max_degree;
+  const char* lazy_option = std::getenv("PSU_LAZY_RELINEARIZE");
+  const bool lazy_relinearize = lazy_option && std::strcmp(lazy_option, "1") == 0;
   seal::Ciphertext acc;
-  encryptor.encrypt_zero(acc);
+  if (!optimized) encryptor.encrypt_zero(acc);
 
-  for (size_t block = 0; block * step <= max_degree; ++block) {
+  for (size_t block = 0; block * step <= poly_degree; ++block) {
     const size_t block_base = block * step;
-    const size_t block_end = std::min(max_degree, block_base + ps_low_degree);
+    const size_t block_end = std::min(poly_degree, block_base + ps_low_degree);
+    if (optimized && block > 0 && block_base == block_end) {
+      if (packed_polys.has_coeff_plaintexts[output_slice][block_base]) {
+        seal::Ciphertext term;
+        evaluator.multiply_plain(all_powers[block_base],
+            packed_polys.coeff_plaintexts[output_slice][block_base], term);
+        evaluator.add_inplace(acc, term);
+      }
+      continue;
+    }
     seal::Ciphertext inner = eval_direct(block_base, block_end, 0);
     if (block == 0) {
-      evaluator.add_inplace(acc, inner);
+      if (optimized) acc = std::move(inner);
+      else evaluator.add_inplace(acc, inner);
       continue;
     }
 
@@ -2023,10 +1910,11 @@ seal::Ciphertext EvalPolyOnPackedSlots(
                  all_powers.size());
     seal::Ciphertext term;
     evaluator.multiply(inner, all_powers[block_base], term);
-    evaluator.relinearize_inplace(term, relin_keys);
+    if (!lazy_relinearize) evaluator.relinearize_inplace(term, relin_keys);
     evaluator.add_inplace(acc, term);
   }
 
+  if (lazy_relinearize && acc.size() > 2) evaluator.relinearize_inplace(acc, relin_keys);
   return acc;
 }
 
@@ -2134,7 +2022,7 @@ std::vector<seal::Ciphertext> ComputeAllPowersFromSources(
     const std::vector<seal::Ciphertext>& source_ciphertexts,
     const std::vector<std::uint32_t>& source_power_vec,
     const std::set<std::uint32_t>& target_powers,
-    const seal::RelinKeys& relin_keys, seal::Evaluator& evaluator) {
+    const seal::RelinKeys& relin_keys, seal::Evaluator& evaluator, size_t max_depth) {
   UPSU_ENFORCE(!target_powers.empty(), "target powers cannot be empty");
   const size_t max_degree = *target_powers.rbegin();
   std::set<std::uint32_t> source_powers(source_power_vec.begin(),
@@ -2142,6 +2030,8 @@ std::vector<seal::Ciphertext> ComputeAllPowersFromSources(
   upsu::PowersDag dag;
   UPSU_ENFORCE(dag.configure(source_powers, target_powers),
                "failed to configure PowersDag");
+  UPSU_ENFORCE(dag.depth() <= max_depth,
+               "source-power depth {} exceeds public limit {}", dag.depth(), max_depth);
   UPSU_ENFORCE(source_ciphertexts.size() == source_power_vec.size(),
                "source ciphertext count {} mismatches source powers {}",
                source_ciphertexts.size(), source_power_vec.size());
@@ -2196,11 +2086,16 @@ void MaterializeSenderOnlineCacheImpl(
                                        prepared->max_degree);
               continue;
             }
+            const char* fused_option = std::getenv("PSU_FUSED_NTT");
+            const bool precompute = fused_option && std::strcmp(fused_option, "1") == 0 &&
+                context_data->parms().coeff_modulus().front().bit_count() > 52;
+            packed.coeff_quotients.resize(prepared->ks);
             packed.coeff_plaintexts_ntt.resize(prepared->ks);
             for (size_t output_slice = 0; output_slice < prepared->ks;
                  ++output_slice) {
               packed.coeff_plaintexts_ntt[output_slice].resize(
                   prepared->max_degree + 1);
+              packed.coeff_quotients[output_slice].resize(prepared->max_degree + 1);
               for (size_t degree = 1; degree <= prepared->max_degree; ++degree) {
                 if (!packed.has_coeff_plaintexts[output_slice][degree]) {
                   continue;
@@ -2213,6 +2108,8 @@ void MaterializeSenderOnlineCacheImpl(
                     packed.coeff_plaintexts[output_slice][degree];
                 evaluator.transform_to_ntt_inplace(
                     packed.coeff_plaintexts_ntt[output_slice][degree], parms_id);
+                if (precompute) packed.coeff_quotients[output_slice][degree] =
+                    paper::NttQuotients(packed.coeff_plaintexts_ntt[output_slice][degree], *context);
                 packed.coeff_plaintexts[output_slice][degree].release();
               }
             }
@@ -2268,15 +2165,14 @@ size_t EstimateFheKeyCommBytes(const ProtocolParams& params) {
   return pk_blob.size() + relin_blob.size();
 }
 
-AlphaSampleMetrics SampleAlphaAfterOprf(
+AlphaSampleMetrics SampleAlphaAfterEncoding(
     const std::vector<std::string>& sender_items, size_t receiver_set_size,
     const ProtocolParams& params) {
   constexpr size_t kSimpleHashCount = 3;
   const size_t m = params.simple_hash_bins;
   const uint64_t prime = params.plain_modulus;
   const size_t item_bit_count =
-      EffectiveItemBitCount(params.sigma1_bits, m,
-                            params.use_permutation_hashing);
+      params.EffectiveItemBitCount();
   const size_t sigma2_bits = CeilDiv(item_bit_count, params.ks);
   const size_t first_domain_size =
       (sigma2_bits < 63)
@@ -2305,8 +2201,7 @@ AlphaSampleMetrics SampleAlphaAfterOprf(
   const uint64_t first_mask =
       (first_bits == 64) ? UINT64_MAX : ((uint64_t{1} << first_bits) - 1);
 
-  DhOprf sender_oprf;
-  auto x_oprf = ComputeSenderOprf(sender_oprf, sender_items);
+  auto x_oprf = encoding::Encode(encoding::FreshSalt(), sender_items);
 
   std::vector<size_t> bin_counts(m, 0);
   std::vector<uint64_t> packed_keys;
@@ -2314,7 +2209,7 @@ AlphaSampleMetrics SampleAlphaAfterOprf(
   for (uint128_t oprf_value : x_oprf) {
     const uint128_t sender_token = MaskBits(oprf_value, params.sigma1_bits);
     const HashedTableItem item =
-        BuildHashedTableItem(sender_token, params.sigma1_bits, m,
+        BuildHashedTableItem(sender_token, item_bit_count, m,
                              params.use_permutation_hashing);
     const uint64_t first =
         FirstSliceOfItem(item.stored_item, params.ks, sigma2_bits, prime);
@@ -2386,46 +2281,37 @@ std::shared_ptr<PreparedSender> PrepareSender(
   const uint64_t prime = params.plain_modulus;
   const size_t m = params.simple_hash_bins;
   const size_t item_bit_count =
-      EffectiveItemBitCount(params.sigma1_bits, m,
-                            params.use_permutation_hashing);
+      params.EffectiveItemBitCount();
 
   UPSU_ENFORCE(m > 0, "simple_hash_bins must be positive");
   UPSU_ENFORCE(params.ks > 0, "ks must be positive");
 
   auto prepared = std::make_shared<PreparedSender>();
   std::vector<uint128_t> sender_tokens;
-  if (params.use_dh_oprf) {
-    prepared->sender_oprf = DhOprf();
-    const auto oprf_start = std::chrono::high_resolution_clock::now();
-    auto x_oprf = ComputeSenderOprf(prepared->sender_oprf, sender_items);
-    const auto oprf_end = std::chrono::high_resolution_clock::now();
-    TraceStage("send", "computed sender offline DH-OPRF in " +
-                           std::to_string(SecondsSince(oprf_start, oprf_end)) +
-                           " s");
-    const auto reduce_start = std::chrono::high_resolution_clock::now();
-    sender_tokens = ComputeReducedHashesFromOprf(x_oprf, params.sigma1_bits);
-    const auto reduce_end = std::chrono::high_resolution_clock::now();
-    TraceStage("send", "reduced sender OPRF outputs to sigma1_bits in " +
-                           std::to_string(
-                               SecondsSince(reduce_start, reduce_end)) +
-                           " s");
+  if (params.use_salted_hash) {
+    const auto hash_start = std::chrono::high_resolution_clock::now();
+    prepared->encoding_salt = encoding::FreshSalt();
+    sender_tokens = encoding::Encode(prepared->encoding_salt, sender_items);
+    TraceStage("send", "computed receiver offline salted BLAKE3 encodings in " +
+                           std::to_string(SecondsSince(hash_start, std::chrono::high_resolution_clock::now())) + " s");
   } else {
     const auto token_start = std::chrono::high_resolution_clock::now();
     sender_tokens =
         EncodeItemsAsProtocolTokens(sender_items, params.sigma1_bits);
     const auto token_end = std::chrono::high_resolution_clock::now();
-    TraceStage("send", "computed sender Blake3 tokens in " +
+    TraceStage("send", "decoded S3MT input encodings in " +
                            std::to_string(
                                SecondsSince(token_start, token_end)) +
                            " s");
   }
+  paper::RequireDistinctEncodings(sender_tokens);
   const auto hash_start = std::chrono::high_resolution_clock::now();
   const size_t effective_kv = 1;
   SimpleHashTable sh_table(m, params.use_permutation_hashing,
                            params.PermutationIndexBits());
   const auto hash_items_start = std::chrono::high_resolution_clock::now();
   auto hashed_items =
-      BuildHashedTableItems(sender_tokens, params.sigma1_bits, m,
+      BuildHashedTableItems(sender_tokens, item_bit_count, m,
                             params.use_permutation_hashing);
   const auto hash_items_end = std::chrono::high_resolution_clock::now();
   TraceStage("send", "built sender hashed table items in " +
@@ -2502,7 +2388,7 @@ std::shared_ptr<PreparedSender> PrepareSender(
         const auto& sub_bin_items = selected.partitioned.bins[bin_idx][sub_idx];
         prepared->bin_polys[bin_idx][sub_idx] =
             BuildPolyLinkBinPolySet(sub_bin_items, prepared->ks,
-                                    prepared->sigma2_bits, prime,
+                                    FieldBitWidth(prime), prime,
                                     params.drop_first_poly);
       }
 
@@ -2560,6 +2446,8 @@ std::optional<std::vector<uint8_t>> SendPreparedImpl(
     const std::shared_ptr<PreparedSender>& prepared,
     const ProtocolParams& params, bool direct_ote,
     OnlineStats* online_stats) {
+  const auto offline_phase_start = std::chrono::high_resolution_clock::now();
+  upsu::set_experiment_phase(true, "interactive_setup");
   const uint64_t prime = params.plain_modulus;
   const size_t ks = prepared->ks;
   const bool use_circuit_peqt = CircuitPeqtEnabled(params);
@@ -2586,17 +2474,6 @@ std::optional<std::vector<uint8_t>> SendPreparedImpl(
   std::optional<PermSenderState> perm_state;
   std::unique_ptr<peqt::PreparedCircuitGmwState> peqt_prepared;
 
-  if (params.use_dh_oprf) {
-    const auto oprf_start = std::chrono::high_resolution_clock::now();
-    RunDhOprfSenderOnline(ctx, prepared->sender_oprf, false);
-    const auto oprf_end = std::chrono::high_resolution_clock::now();
-    if (online_stats) {
-      online_stats->setup_time_s += SecondsSince(oprf_start, oprf_end);
-    }
-    TraceStage("send", "finished sender DH-OPRF online step");
-  } else {
-    TraceStage("send", "using sender Blake3 tokens; no DH-OPRF online step");
-  }
 
   std::vector<uint64_t> meta = {static_cast<uint64_t>(m),
                                 static_cast<uint64_t>(alpha_eff),
@@ -2655,6 +2532,14 @@ std::optional<std::vector<uint8_t>> SendPreparedImpl(
                          relin_buf.size());
   seal::RelinKeys relin_keys =
       DeserializeSealObject<seal::RelinKeys>(context, relin_blob);
+  if(online_stats) {
+    online_stats->fhe_key_comm_bytes=
+        ctx->MessageBytes(pk_blob.size(),kPublicKeyTag)+ctx->MessageBytes(relin_blob.size(),kRelinKeysTag);
+    online_stats->fhe_key_saved_bytes=
+        upsu::serialization::UncompressedSize(reinterpret_cast<const uint8_t*>(pk_blob.data()),pk_blob.size())+
+        upsu::serialization::UncompressedSize(reinterpret_cast<const uint8_t*>(relin_blob.data()),relin_blob.size())-
+        pk_blob.size()-relin_blob.size();
+  }
   seal::Evaluator evaluator(*context);
   seal::BatchEncoder encoder(*context);
   const size_t slot_count = encoder.slot_count();
@@ -2664,6 +2549,30 @@ std::optional<std::vector<uint8_t>> SendPreparedImpl(
   const auto sanitize_parms_id = context->first_parms_id();
   const auto response_parms_id = SelectResponseParmsId(
       *context, sanitize_parms_id, params.response_mod_switch_steps);
+
+  const auto setup_end = std::chrono::high_resolution_clock::now();
+  if (online_stats) {
+    online_stats->setup_time_s += SecondsSince(setup_start, setup_end);
+  }
+  TraceStage("send", "received receiver public key");
+  const char offline_ready = 1;
+  ctx->Send(ctx->NextRank(), upsu::Bytes(&offline_ready, 1), "PSU:offline_ready_v2");
+  upsu::set_experiment_phase(false, "before_online_encoding");
+  if (upsu::experiment_phase_threads_enabled() && online_stats) {
+    online_stats->setup_time_s = SecondsSince(offline_phase_start, std::chrono::high_resolution_clock::now());
+  }
+
+  if (params.use_salted_hash) {
+    UPSU_ENFORCE(!prepared->salt_disclosed, "salted preprocessing is single-use");
+    const auto hash_start = std::chrono::high_resolution_clock::now();
+    ctx->Send(ctx->NextRank(), upsu::Bytes(prepared->encoding_salt.data(), prepared->encoding_salt.size()), encoding::kSaltTag);
+    prepared->salt_disclosed = true;
+    if (online_stats) {
+      online_stats->encoding_time_s += SecondsSince(hash_start, std::chrono::high_resolution_clock::now());
+      online_stats->encoding_comm_bytes += ctx->MessageBytes(prepared->encoding_salt.size(), encoding::kSaltTag);
+    }
+    std::cout << "[input_encoding] receiver sent salt_bits=128 hash=BLAKE3 phase=online" << std::endl;
+  }
 
   std::vector<ResponseMaskToken> response_masks(response_count);
   upsu::parallel_for(
@@ -2679,9 +2588,9 @@ std::optional<std::vector<uint8_t>> SendPreparedImpl(
               static_cast<size_t>(response_idx) / evals_per_batch;
           const size_t slot_offset = batch_idx * slot_count;
           const size_t active_slots = std::min(slot_count, m - slot_offset);
-          std::vector<uint64_t> mask_slots(active_slots, 0);
+          std::vector<uint64_t> mask_slots(slot_count, 0);
           if (use_circuit_peqt) {
-            mask_slots = SampleResponseMask(active_slots, prime);
+            mask_slots = SampleResponseMask(slot_count, prime);
           }
           response_masks[static_cast<size_t>(response_idx)] =
               PrepareResponseMask(
@@ -2719,11 +2628,6 @@ std::optional<std::vector<uint8_t>> SendPreparedImpl(
       }
     }
   }
-  const auto setup_end = std::chrono::high_resolution_clock::now();
-  if (online_stats) {
-    online_stats->setup_time_s += SecondsSince(setup_start, setup_end);
-  }
-  TraceStage("send", "received receiver public key");
 
   const size_t query_slice_count = 1;
   TraceStage("send", "waiting for encrypted query powers");
@@ -2772,13 +2676,14 @@ std::optional<std::vector<uint8_t>> SendPreparedImpl(
       reconstructed_powers[query_slice_idx] = ComputeAllPowersFromSources(
           source_ciphertexts, source_power_vec, prepared->target_powers,
           relin_keys,
-          evaluator);
+          evaluator, params.query_powers_max_depth);
       if (prepared->packed_plaintexts_online_ready) {
         reconstructed_powers_ntt[query_slice_idx] =
             TransformCiphertextsToNtt(reconstructed_powers[query_slice_idx],
                                       evaluator);
       }
     }
+    TraceStage("send", "derived encrypted target powers for batch " + std::to_string(batch_idx));
 
     upsu::parallel_for(
         0, evals_per_batch, [&](int64_t begin, int64_t end) {
@@ -2805,7 +2710,7 @@ std::optional<std::vector<uint8_t>> SendPreparedImpl(
                           prepared->packed_bin_plaintexts[batch_idx][sub_idx],
                           reconstructed_powers[variable_slice], s, max_degree,
                           ps_low_degree, relin_keys, local_evaluator,
-                          local_encryptor,
+                          local_encryptor, *context,
                           prepared->packed_plaintexts_online_ready
                               ? &reconstructed_powers_ntt[variable_slice]
                               : nullptr);
@@ -2879,6 +2784,8 @@ std::optional<std::vector<uint8_t>> SendPreparedImpl(
       return std::nullopt;
     }
 
+    upsu::diagnostics::Write("sender_masks.bin",sender_peqt_masks);
+    upsu::diagnostics::Write("sender_eq.bin",sender_eq_shares);
     auto bin_membership_share = std::move(sender_eq_shares);
     if (use_permuted_peqt) {
       bin_membership_share = ApplyPermutedByteSharesSender(
@@ -2887,6 +2794,7 @@ std::optional<std::vector<uint8_t>> SendPreparedImpl(
     }
     TraceStage("send",
                "finished packed PEQT and derived bin-level direct OTE shares");
+    upsu::diagnostics::Write("sender_permuted.bin",bin_membership_share);
     return bin_membership_share;
   }
 
@@ -2933,6 +2841,8 @@ RecvPhaseOutputs RecvPhaseCore(
     const std::shared_ptr<upsu::net::Context>& ctx,
     const std::vector<std::string>& receiver_items, const ProtocolParams& params,
     bool direct_ote, OnlineStats* online_stats) {
+  const auto offline_phase_start = std::chrono::high_resolution_clock::now();
+  upsu::set_experiment_phase(true, "interactive_setup");
   const size_t ny = receiver_items.size();
   const uint64_t prime = params.plain_modulus;
   const bool use_circuit_peqt = CircuitPeqtEnabled(params);
@@ -2940,24 +2850,6 @@ RecvPhaseOutputs RecvPhaseCore(
   const size_t effective_kv = 1;
   const size_t peqt_field_bits = FieldBitWidth(prime);
   const size_t output_slice_begin = OutputSliceBegin(params);
-
-  const auto token_start = std::chrono::high_resolution_clock::now();
-  std::vector<uint128_t> full_hashed_items;
-  if (params.use_dh_oprf) {
-    auto y_oprf = RunDhOprfReceiver(ctx, receiver_items);
-    full_hashed_items =
-        ComputeReducedHashesFromOprf(y_oprf, params.sigma1_bits);
-  } else {
-    full_hashed_items =
-        EncodeItemsAsProtocolTokens(receiver_items, params.sigma1_bits);
-  }
-  const auto token_end = std::chrono::high_resolution_clock::now();
-  if (online_stats) {
-    online_stats->setup_time_s += SecondsSince(token_start, token_end);
-  }
-  TraceStage("recv", params.use_dh_oprf
-                         ? "finished receiver online DH-OPRF"
-                         : "prepared receiver Blake3 tokens");
 
   auto meta_buf = ctx->Recv(ctx->PrevRank(), kMetaTag);
   UPSU_ENFORCE(meta_buf.size() == 6 * sizeof(uint64_t),
@@ -2984,8 +2876,7 @@ RecvPhaseOutputs RecvPhaseCore(
                "receiver simple_hash_bins {} mismatches sender {}",
                params.simple_hash_bins, m);
   const size_t receiver_item_bit_count =
-      EffectiveItemBitCount(params.sigma1_bits, m,
-                            params.use_permutation_hashing);
+      params.EffectiveItemBitCount();
   UPSU_ENFORCE(ks > 0, "ks must be positive");
   UPSU_ENFORCE(alpha_eff > 0, "alpha_eff must be positive");
   UPSU_ENFORCE(max_degree > 0, "max_degree must be positive");
@@ -2998,8 +2889,6 @@ RecvPhaseOutputs RecvPhaseCore(
   const size_t peqt_packed_bits = output_poly_count * peqt_field_bits;
   const size_t perm_row_bytes = PackedRowBytes(peqt_packed_bits);
   TraceStage("recv", "received metadata");
-  auto y_items = BuildHashedTableItems(full_hashed_items, params.sigma1_bits, m,
-                                       params.use_permutation_hashing);
   std::optional<PermReceiverState> perm_state;
   std::unique_ptr<peqt::PreparedCircuitGmwState> peqt_prepared;
   if (use_permuted_peqt) {
@@ -3035,70 +2924,6 @@ RecvPhaseOutputs RecvPhaseCore(
     TraceStage("recv", "finished PEQT triple setup");
   }
 
-  const size_t total_sub_items = ny * effective_kv;
-  std::vector<std::pair<HashedTableItem, size_t>> receiver_sub_items;
-  receiver_sub_items.reserve(total_sub_items);
-  for (size_t i = 0; i < ny; ++i) {
-    for (size_t j = 0; j < effective_kv; ++j) {
-      const size_t item_id = i * effective_kv + j;
-      receiver_sub_items.emplace_back(y_items[item_id], item_id);
-    }
-  }
-  TraceStage("recv", "prepared receiver sub-items");
-
-  CuckooTable ct(m, params.use_permutation_hashing,
-                 params.PermutationIndexBits());
-  bool cuckoo_ok = false;
-  std::mt19937_64 rng(upsu::SecureRandU64());
-  TraceStage("recv", "starting cuckoo insertion");
-  for (size_t attempt = 0; attempt < 8 && !cuckoo_ok; ++attempt) {
-    CuckooTable trial(m, params.use_permutation_hashing,
-                      params.PermutationIndexBits());
-    if (attempt > 0) {
-      std::shuffle(receiver_sub_items.begin(), receiver_sub_items.end(), rng);
-    }
-
-    bool inserted = true;
-    for (const auto& [sub_item, item_id] : receiver_sub_items) {
-      if (!trial.Insert(sub_item, item_id)) {
-        inserted = false;
-        break;
-      }
-    }
-    if (inserted) {
-      ct = std::move(trial);
-      cuckoo_ok = true;
-      TraceStage("recv", "cuckoo insertion succeeded at attempt " +
-                             std::to_string(attempt + 1));
-    } else {
-      TraceStage("recv", "cuckoo insertion failed at attempt " +
-                             std::to_string(attempt + 1));
-    }
-  }
-  UPSU_ENFORCE(cuckoo_ok,
-               "cuckoo insertion failed after multiple randomized retries");
-  TraceStage("recv", "built receiver cuckoo table");
-
-  const bool enable_spy_detection = false;
-  ct.FillSpies(enable_spy_detection, receiver_item_bit_count,
-               params.sigma1_bits);
-  TraceStage("recv", "filled spy bins if needed");
-
-  std::vector<uint64_t> slices_buf(m * ks, 0);
-  for (size_t bin_idx = 0; bin_idx < m; ++bin_idx) {
-    uint128_t base = 0;
-    if (ct.occupied[bin_idx]) {
-      base = ct.bins[bin_idx];
-    } else {
-      base = RandomMaskedItem(receiver_item_bit_count);
-    }
-    auto slices = SliceItem(base, ks, sigma2_bits);
-    for (size_t s = 0; s < ks; ++s) {
-      slices_buf[bin_idx * ks + s] = slices[s] % prime;
-    }
-  }
-  TraceStage("recv", "prepared receiver slices");
-
   const auto setup_start = std::chrono::high_resolution_clock::now();
   auto context = CreateBfvContext(params);
   seal::KeyGenerator keygen(*context);
@@ -3109,6 +2934,9 @@ RecvPhaseOutputs RecvPhaseCore(
   keygen.create_relin_keys(relin_keys);
   seal::BatchEncoder encoder(*context);
   seal::Encryptor encryptor(*context, public_key);
+  encryptor.set_secret_key(secret_key);
+  const char* seeded_option = std::getenv("PSU_SEEDED_QUERY");
+  const bool seeded_query = seeded_option && std::strcmp(seeded_option, "1") == 0;
   seal::Decryptor decryptor(*context, secret_key);
   const size_t slot_count = encoder.slot_count();
   const size_t packed_bin_batch_count = CeilDiv(m, slot_count);
@@ -3121,11 +2949,81 @@ RecvPhaseOutputs RecvPhaseCore(
   ctx->SendAsync(ctx->NextRank(),
                  upsu::Bytes(relin_blob.data(), relin_blob.size()),
                  kRelinKeysTag);
+  if(online_stats) {
+    online_stats->fhe_key_comm_bytes=
+        ctx->MessageBytes(pk_blob.size(),kPublicKeyTag)+ctx->MessageBytes(relin_blob.size(),kRelinKeysTag);
+    online_stats->fhe_key_saved_bytes=
+        upsu::serialization::UncompressedSize(reinterpret_cast<const uint8_t*>(pk_blob.data()),pk_blob.size())+
+        upsu::serialization::UncompressedSize(reinterpret_cast<const uint8_t*>(relin_blob.data()),relin_blob.size())-
+        pk_blob.size()-relin_blob.size();
+  }
+  (void)ctx->Recv(ctx->PrevRank(), "PSU:offline_ready_v2");
   const auto setup_end = std::chrono::high_resolution_clock::now();
   if (online_stats) {
     online_stats->setup_time_s += SecondsSince(setup_start, setup_end);
   }
   TraceStage("recv", "sent receiver public key");
+  upsu::set_experiment_phase(false, "before_online_encoding");
+  if (upsu::experiment_phase_threads_enabled() && online_stats) {
+    online_stats->setup_time_s = SecondsSince(offline_phase_start, std::chrono::high_resolution_clock::now());
+  }
+
+  const auto token_start = std::chrono::high_resolution_clock::now();
+  std::vector<uint128_t> full_hashed_items;
+  if (params.use_salted_hash) {
+    const auto bytes = ctx->Recv(ctx->PrevRank(), encoding::kSaltTag);
+    UPSU_ENFORCE(bytes.size() == encoding::Salt{}.size(), "invalid encoding salt size");
+    encoding::Salt salt{};
+    std::memcpy(salt.data(), bytes.data(), salt.size());
+    full_hashed_items = encoding::Encode(salt, receiver_items);
+    if (online_stats) online_stats->encoding_comm_bytes += ctx->MessageBytes(salt.size(), encoding::kSaltTag);
+    std::cout << "[input_encoding] sender received salt_bits=128 hash=BLAKE3 phase=online" << std::endl;
+  } else {
+    full_hashed_items =
+        EncodeItemsAsProtocolTokens(receiver_items, params.sigma1_bits);
+  }
+  const auto token_end = std::chrono::high_resolution_clock::now();
+  if (online_stats) {
+    online_stats->encoding_time_s += SecondsSince(token_start, token_end);
+  }
+  TraceStage("recv", std::string(params.use_salted_hash
+                         ? "computed sender online salted BLAKE3 encodings in "
+                         : "decoded S3MT input encodings in ") +
+                         std::to_string(SecondsSince(token_start, token_end)) + " s");
+
+  paper::RequireDistinctEncodings(full_hashed_items);
+  auto y_items = BuildHashedTableItems(full_hashed_items, receiver_item_bit_count, m,
+                                       params.use_permutation_hashing);
+  const size_t total_sub_items = ny * effective_kv;
+  CuckooTable ct(m, false, 0);
+  std::vector<std::array<size_t, 3>> candidates;
+  candidates.reserve(y_items.size());
+  for (const auto& item : y_items) candidates.push_back(paper::CandidateBins(item.full_item, m));
+  ct.item_ids = paper::PlaceCuckoo(candidates, m);
+  for (size_t bin = 0; bin < m; ++bin) {
+    const size_t id = ct.item_ids[bin];
+    if (id == CuckooTable::kInvalidItemId) continue;
+    ct.occupied[bin] = true;
+    ct.bins[bin] = y_items[id].stored_item;
+    ct.full_bins[bin] = y_items[id].full_item;
+  }
+  TraceStage("recv", "built receiver cuckoo table");
+
+  const bool enable_spy_detection = false;
+  ct.FillSpies(enable_spy_detection, receiver_item_bit_count,
+               params.sigma1_bits);
+  TraceStage("recv", "filled spy bins if needed");
+
+  std::vector<uint64_t> slices_buf(m * ks, 0);
+  paper::FieldSampler dummy_sampler;
+  for (size_t bin_idx = 0; bin_idx < m; ++bin_idx) {
+    for (size_t j = 0; j < ks; ++j) {
+      slices_buf[bin_idx * ks + j] = ct.occupied[bin_idx]
+          ? ExtractSliceOfItem(ct.bins[bin_idx], j, sigma2_bits)
+          : dummy_sampler(prime);
+    }
+  }
+  TraceStage("recv", "prepared receiver slices");
 
   const size_t query_slice_count = 1;
   const size_t expected_query_ct_count =
@@ -3157,8 +3055,13 @@ RecvPhaseOutputs RecvPhaseCore(
             ++current_power;
           }
           auto power_pt = EncodeSlots(encoder, power_slots, prime);
-          auto power_ct = encryptor.encrypt(power_pt);
-          AppendSerializedSealObject(&packed_query, power_ct);
+          if (seeded_query) {
+            auto power_ct = encryptor.encrypt_symmetric(power_pt);
+            AppendSerializedSealObject(&packed_query, power_ct);
+          } else {
+            auto power_ct = encryptor.encrypt(power_pt);
+            AppendSerializedSealObject(&packed_query, power_ct);
+          }
         }
       } else {
         std::vector<uint64_t> base_slots(active_slots, 0ULL);
@@ -3182,8 +3085,13 @@ RecvPhaseOutputs RecvPhaseCore(
             ++current_power;
           }
           auto power_pt = EncodeSlots(encoder, power_slots, prime);
-          auto power_ct = encryptor.encrypt(power_pt);
-          AppendSerializedSealObject(&packed_query, power_ct);
+          if (seeded_query) {
+            auto power_ct = encryptor.encrypt_symmetric(power_pt);
+            AppendSerializedSealObject(&packed_query, power_ct);
+          } else {
+            auto power_ct = encryptor.encrypt(power_pt);
+            AppendSerializedSealObject(&packed_query, power_ct);
+          }
         }
       }
     }
@@ -3377,9 +3285,13 @@ RecvPhaseOutputs RecvPhaseCore(
       online_stats->peqt_local_recv_bytes += peqt_local_diff.recv_bytes;
     }
     if (direct_ote) {
+      upsu::diagnostics::Write("receiver_decoded.bin",receiver_peqt_inputs);
+      upsu::diagnostics::Write("receiver_eq.bin",receiver_eq_shares);
+      upsu::diagnostics::Write("receiver_ids.bin",ct.item_ids);
       auto bin_share = std::move(receiver_eq_shares);
       auto encoded_ote_values = EncodeItemsForFinalOte(receiver_items);
-      std::vector<uint64_t> bin_values(m, 0);
+      std::vector<uint128_t> bin_values(m, 0);
+      std::vector<uint8_t> bin_valid(m, 0);
       for (size_t bin_idx = 0; bin_idx < m; ++bin_idx) {
         if (!ct.occupied[bin_idx] || ct.is_spy[bin_idx]) {
           continue;
@@ -3388,17 +3300,22 @@ RecvPhaseOutputs RecvPhaseCore(
         if (item_id != CuckooTable::kInvalidItemId &&
             item_id < encoded_ote_values.size()) {
           bin_values[bin_idx] = encoded_ote_values[item_id];
+          bin_valid[bin_idx] = 1;
         }
       }
       if (use_permuted_peqt) {
         bin_share = ApplyPermutedByteSharesReceiver(bin_share, &*perm_state,
                                                     online_stats);
         bin_values = PermuteValuesByPermutation(bin_values, *perm_state);
+        bin_valid = PermuteValuesByPermutation(bin_valid, *perm_state);
         TraceStage("recv", "applied direct OTE permutation share");
       }
       RecvPhaseOutputs outputs;
+      upsu::diagnostics::Write("receiver_permuted.bin",bin_share);
+      upsu::diagnostics::Write("receiver_values.bin",bin_values);
       outputs.direct_ote_inputs.sender_share = std::move(bin_share);
       outputs.direct_ote_inputs.sender_values = std::move(bin_values);
+      outputs.direct_ote_inputs.sender_valid = std::move(bin_valid);
       TraceStage("recv", "finished sender-side direct EQ-OTE input derivation");
       return outputs;
     } else {
@@ -3511,6 +3428,7 @@ S3mtReceiverOutput RunS3mtReceiver(
   S3mtReceiverOutput output;
   output.choice_share = std::move(direct.sender_share);
   output.aligned_values = std::move(direct.sender_values);
+  output.aligned_valid = std::move(direct.sender_valid);
   return output;
 }
 
@@ -3556,6 +3474,7 @@ std::vector<std::string> RecvItems(
 }
 
 PrimitiveBenchMetrics RunLocalPackedZeroTestBench(size_t n, size_t bit_width) {
+  if (upsu::experiment_phase_threads_enabled()) upsu::set_num_threads(8);
   UPSU_ENFORCE(n > 0, "packed zero-test bench requires n > 0");
   UPSU_ENFORCE(bit_width > 0 && bit_width <= 128,
                "packed zero-test bit_width must be in [1, 128], got={}",
@@ -3593,6 +3512,7 @@ PrimitiveBenchMetrics RunLocalPackedZeroTestBench(size_t n, size_t bit_width) {
   };
 
   auto setup_party = [&](int rank) -> PackedZeroPartyRun {
+    upsu::pin_benchmark_thread(rank, true);
     PackedZeroPartyRun run;
     const auto link_begin = TakeLinkCommSnapshot(lctxs[rank]);
     const auto start = std::chrono::high_resolution_clock::now();
@@ -3615,10 +3535,13 @@ PrimitiveBenchMetrics RunLocalPackedZeroTestBench(size_t n, size_t bit_width) {
   auto sender_run = sender_setup_fut.get();
   auto receiver_run = receiver_setup_fut.get();
 
+  if (upsu::experiment_phase_threads_enabled()) upsu::set_num_threads(1);
+
   peqt::ResetLocalCommStats();
 
   auto run_party = [&](int rank, PackedZeroPartyRun* run,
                        const std::vector<uint128_t>& input) {
+    upsu::pin_benchmark_thread(rank);
     const auto link_begin = TakeLinkCommSnapshot(lctxs[rank]);
     const auto start = std::chrono::high_resolution_clock::now();
     run->shares = peqt::RunPreparedEqU128Vec2PCPreRot(
@@ -3678,6 +3601,7 @@ PrimitiveBenchMetrics RunLocalPackedZeroTestBench(size_t n, size_t bit_width) {
 
 PrimitiveBenchMetrics RunLocalRandomPermutationBench(size_t n,
                                                      size_t block_size) {
+  if (upsu::experiment_phase_threads_enabled()) upsu::set_num_threads(8);
   UPSU_ENFORCE(n > 0, "permutation bench requires n > 0");
   UPSU_ENFORCE(block_size > 0, "permutation bench block_size must be > 0");
   UPSU_ENFORCE(n % block_size == 0,
@@ -3706,21 +3630,27 @@ PrimitiveBenchMetrics RunLocalRandomPermutationBench(size_t n,
   OnlineStats receiver_stats;
 
   auto sender_setup_fut = std::async(std::launch::async, [&] {
+    upsu::pin_benchmark_thread(0, true);
     return SetupPermutedPeqtSender(n, 1, &sender_stats);
   });
   auto receiver_setup_fut = std::async(std::launch::async, [&] {
+    upsu::pin_benchmark_thread(1, true);
     return SetupPermutedPeqtReceiver(n, 1, block_size, &receiver_stats);
   });
   auto sender_state = sender_setup_fut.get();
   auto receiver_state = receiver_setup_fut.get();
 
+  if (upsu::experiment_phase_threads_enabled()) upsu::set_num_threads(1);
+
   std::vector<uint8_t> sender_out;
   std::vector<uint8_t> receiver_out;
   auto sender_apply_fut = std::async(std::launch::async, [&] {
+    upsu::pin_benchmark_thread(0);
     sender_out =
         ApplyPermutedByteSharesSender(sender_share, &sender_state, &sender_stats);
   });
   auto receiver_apply_fut = std::async(std::launch::async, [&] {
+    upsu::pin_benchmark_thread(1);
     receiver_out = ApplyPermutedByteSharesReceiver(receiver_share,
                                                    &receiver_state,
                                                    &receiver_stats);

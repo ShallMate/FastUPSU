@@ -13,6 +13,9 @@ namespace upsu {
 int intraop_default_num_threads();
 int get_num_threads();
 void set_num_threads(int count);
+void pin_benchmark_thread(int rank, bool offline = false);
+bool experiment_phase_threads_enabled();
+void set_experiment_phase(bool offline, const char* stage);
 
 template <typename Fn>
 void parallel_for(int64_t begin, int64_t end, int64_t grain, Fn&& fn) {

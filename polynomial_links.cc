@@ -1,5 +1,6 @@
 
 #include "polynomial_links.h"
+#include "small_field_polynomials.h"
 
 #include <cassert>
 #include <cstdint>
@@ -221,6 +222,9 @@ uint128_t UnsliceItem(const std::vector<uint64_t>& slices, size_t sigma2_bits) {
 PolyLinkSubBin BuildPolyLinkSubBin(const std::vector<uint128_t>& items, size_t ks,
                          size_t sigma2_bits, uint64_t prime,
                          bool drop_first_poly) {
+  if (prime == 65537 && ks > 0 && items.size() <= 2048 && small_field::Enabled()) {
+    return small_field::Build(items, ks, sigma2_bits, drop_first_poly);
+  }
   PolyLinkSubBin sub_bin;
   sub_bin.ks = ks;
   size_t b = items.size();

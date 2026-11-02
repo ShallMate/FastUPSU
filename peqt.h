@@ -232,6 +232,7 @@ inline coproto::AsioSocket ConnectPeqtSocket(const std::string& address,
 }
 
 inline size_t GmwThreadCount() {
+  if (upsu::experiment_phase_threads_enabled()) return upsu::get_num_threads();
   static const size_t thread_count = [] {
     if (const char* env = std::getenv("PSU_PEQT_GMW_THREADS")) {
       char* end = nullptr;
@@ -260,6 +261,8 @@ inline size_t PeqtBatchItemCount() {
 }
 
 inline size_t PeqtParallelBatchCount() {
+  // Each prepared batch can itself use all eight offline workers.
+  if (upsu::experiment_phase_threads_enabled()) return 1;
   static const size_t parallel_batches = [] {
     if (const char* env = std::getenv("PSU_PEQT_PARALLEL_BATCHES")) {
       char* end = nullptr;
@@ -379,8 +382,9 @@ inline std::shared_ptr<PreparedBatchCircuitGmwState> PrepareBatchCircuitGmw(
   state->sock =
       std::make_unique<coproto::AsioSocket>(ConnectPeqtSocket(address, rank == 1));
   auto local_cir = cir;
-  state->gmw.init(n, local_cir, GmwThreadCount(), rank,
-                  rank == 0 ? oc::ZeroBlock : oc::OneBlock);
+  const size_t evaluation_threads = upsu::experiment_phase_threads_enabled() ? 1 : GmwThreadCount();
+  state->gmw.init(n, local_cir, evaluation_threads, rank,
+                  oc::toBlock(upsu::SecureRandU64(), upsu::SecureRandU64()));
 
   const auto bytes_begin = TakeSocketBytesSnapshot(*state->sock);
   PeqtDebugLog("batch generateTriple start tag=" + tag_prefix);

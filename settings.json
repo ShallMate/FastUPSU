@@ -20,7 +20,6 @@
   "bench_filter": "",
   "trace": true,
   "synthetic_online": false,
-  "dh_oprf": true,
   "ks": 4,
   "permutation_hashing": true,
   "circuit_peqt": true,
@@ -34,82 +33,143 @@
   "ote_threads": 1,
   "ote_auto_iknp_max": 4096,
   "ote_auto_softspoken_max": 262144,
-  "query_powers": [1, 3, 11, 18, 45, 225],
+  "query_powers": [
+    1,
+    3,
+    11,
+    18,
+    45,
+    225
+  ],
   "mod_switch_steps": 2,
   "response_flood_bits": 80,
   "poly_modulus_degree": 8192,
-  "coeff_modulus_bits": [56, 56, 56, 50],
+  "coeff_modulus_bits": [
+    56,
+    56,
+    56,
+    50
+  ],
   "plain_modulus": 65537,
-
   "profile_x20_y11_medium_nx": 1048576,
   "profile_x20_y11_medium_ny": 2048,
   "profile_x20_y11_medium_cap": 128,
   "profile_x20_y11_simple_hash_bins": 2601,
-  "profile_x20_y11_coeff_modulus_bits": [46, 46, 46, 46],
-
+  "profile_x20_y11_coeff_modulus_bits": [
+    46,
+    46,
+    46,
+    46
+  ],
   "profile_x20_y12_medium_nx": 1048576,
   "profile_x20_y12_medium_ny": 4096,
   "profile_x20_y12_medium_cap": 128,
   "profile_x20_y12_simple_hash_bins": 5202,
-  "profile_x20_y12_coeff_modulus_bits": [46, 46, 46, 46],
-
+  "profile_x20_y12_coeff_modulus_bits": [
+    46,
+    46,
+    46,
+    46
+  ],
   "profile_x20_y13_medium_nx": 1048576,
   "profile_x20_y13_medium_ny": 8192,
   "profile_x20_y13_medium_cap": 128,
   "profile_x20_y13_simple_hash_bins": 10404,
-  "profile_x20_y13_coeff_modulus_bits": [46, 46, 46, 46],
-
+  "profile_x20_y13_coeff_modulus_bits": [
+    46,
+    46,
+    46,
+    46
+  ],
   "profile_x20_y14_medium_nx": 1048576,
   "profile_x20_y14_medium_ny": 16384,
   "profile_x20_y14_medium_cap": 128,
   "profile_x20_y14_simple_hash_bins": 20808,
-  "profile_x20_y14_coeff_modulus_bits": [46, 46, 46, 46],
-
+  "profile_x20_y14_coeff_modulus_bits": [
+    46,
+    46,
+    46,
+    46
+  ],
   "profile_x22_y11_medium_nx": 4194304,
   "profile_x22_y11_medium_ny": 2048,
   "profile_x22_y11_medium_cap": 128,
   "profile_x22_y11_simple_hash_bins": 2601,
-  "profile_x22_y11_coeff_modulus_bits": [48, 48, 48, 48],
-
+  "profile_x22_y11_coeff_modulus_bits": [
+    48,
+    48,
+    48,
+    48
+  ],
   "profile_x22_y12_medium_nx": 4194304,
   "profile_x22_y12_medium_ny": 4096,
   "profile_x22_y12_medium_cap": 128,
   "profile_x22_y12_simple_hash_bins": 5202,
-  "profile_x22_y12_coeff_modulus_bits": [48, 48, 48, 48],
-
+  "profile_x22_y12_coeff_modulus_bits": [
+    48,
+    48,
+    48,
+    48
+  ],
   "profile_x22_y13_medium_nx": 4194304,
   "profile_x22_y13_medium_ny": 8192,
   "profile_x22_y13_medium_cap": 128,
   "profile_x22_y13_simple_hash_bins": 10404,
-  "profile_x22_y13_coeff_modulus_bits": [48, 48, 48, 48],
-
+  "profile_x22_y13_coeff_modulus_bits": [
+    48,
+    48,
+    48,
+    48
+  ],
   "profile_x22_y14_medium_nx": 4194304,
   "profile_x22_y14_medium_ny": 16384,
   "profile_x22_y14_medium_cap": 128,
   "profile_x22_y14_simple_hash_bins": 20808,
-  "profile_x22_y14_coeff_modulus_bits": [48, 48, 48, 48],
-
+  "profile_x22_y14_coeff_modulus_bits": [
+    48,
+    48,
+    48,
+    48
+  ],
   "profile_x24_y11_medium_nx": 16777216,
   "profile_x24_y11_medium_ny": 2048,
   "profile_x24_y11_medium_cap": 128,
   "profile_x24_y11_simple_hash_bins": 4096,
-  "profile_x24_y11_coeff_modulus_bits": [56, 56, 56, 50],
-
+  "profile_x24_y11_coeff_modulus_bits": [
+    56,
+    56,
+    56,
+    50
+  ],
   "profile_x24_y12_medium_nx": 16777216,
   "profile_x24_y12_medium_ny": 4096,
   "profile_x24_y12_medium_cap": 128,
   "profile_x24_y12_simple_hash_bins": 5202,
-  "profile_x24_y12_coeff_modulus_bits": [56, 56, 56, 50],
-
+  "profile_x24_y12_coeff_modulus_bits": [
+    56,
+    56,
+    56,
+    50
+  ],
   "profile_x24_y13_medium_nx": 16777216,
   "profile_x24_y13_medium_ny": 8192,
   "profile_x24_y13_medium_cap": 128,
   "profile_x24_y13_simple_hash_bins": 10404,
-  "profile_x24_y13_coeff_modulus_bits": [56, 56, 56, 50],
-
+  "profile_x24_y13_coeff_modulus_bits": [
+    56,
+    56,
+    56,
+    50
+  ],
   "profile_x24_y14_medium_nx": 16777216,
   "profile_x24_y14_medium_ny": 16384,
   "profile_x24_y14_medium_cap": 128,
   "profile_x24_y14_simple_hash_bins": 24576,
-  "profile_x24_y14_coeff_modulus_bits": [56, 56, 56, 50]
+  "profile_x24_y14_coeff_modulus_bits": [
+    56,
+    56,
+    56,
+    50
+  ],
+  "salted_hash": true
 }

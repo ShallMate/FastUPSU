@@ -6,3 +6,6 @@
 *.bin
 *.csv
 *.log
+__pycache__/
+*.pyc
+/benchmarks/.experiment.lock

@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <array>
+#include <cstdlib>
 #include <cerrno>
 #include <cstring>
 #include <stdexcept>
@@ -212,8 +213,17 @@ std::shared_ptr<Context> Context::Connect(const std::vector<std::string>& partie
 std::vector<std::shared_ptr<Context>> Context::SetupWorld(size_t party_count) {
   UPSU_ENFORCE(party_count == 2, "only two-party worlds are supported");
   int sockets[2] = {-1, -1};
-  UPSU_ENFORCE(::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0,
-               "socketpair failed: {}", std::strerror(errno));
+  if (const char* port = std::getenv("PSU_LOCAL_TCP_PORT")) {
+    const Endpoint endpoint{"127.0.0.1", port};
+    const int listener = MakeListener(endpoint);
+    sockets[1] = ConnectWithRetry(endpoint, 600000);
+    sockets[0] = ::accept(listener, nullptr, nullptr);
+    ::close(listener);
+    UPSU_ENFORCE(sockets[0] >= 0, "local TCP accept failed");
+  } else {
+    UPSU_ENFORCE(::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0,
+                 "socketpair failed: {}", std::strerror(errno));
+  }
   constexpr uint64_t kDefaultTimeoutMs = 10 * 60 * 1000;
   return {
       std::shared_ptr<Context>(new Context(std::make_shared<Transport>(sockets[0]),
@@ -223,6 +233,10 @@ std::vector<std::shared_ptr<Context>> Context::SetupWorld(size_t party_count) {
 }
 
 void Context::SetRecvTimeout(uint64_t timeout_ms) { timeout_ms_.store(timeout_ms); }
+
+size_t Context::MessageBytes(size_t payload_size, const std::string& tag) const {
+  return sizeof(FrameHeader)+channel_.size()+tag.size()+payload_size;
+}
 
 void Context::Send(size_t destination, ByteView data, const std::string& tag) {
   UPSU_ENFORCE(destination < 2 && destination != rank_,

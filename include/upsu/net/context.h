@@ -50,6 +50,7 @@ class Context {
   Buffer Recv(size_t source, const std::string& tag);
   std::unique_ptr<Context> Spawn(const std::string& suffix) const;
   std::shared_ptr<LinkStats> GetStats() const;
+  size_t MessageBytes(size_t payload_size, const std::string& tag) const;
 
  private:
   struct Transport;
